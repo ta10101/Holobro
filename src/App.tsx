@@ -29,7 +29,8 @@ import {
   type ContactRow,
 } from './holochain'
 import { AssistantPanel } from './assistant/AssistantPanel'
-import { NetworkToolsPanel } from './network/NetworkToolsPanel'
+import { NetworkToolsPanel, type IpStatsResult } from './network/NetworkToolsPanel'
+import { IrcDockPanel } from './irc/IrcDockPanel'
 import { HoloBroLogo } from './components/HoloBroLogo'
 import { StreetTags } from './components/StreetTags'
 import { attachLocalVideo, createPeerConnection, wireRemoteStream } from './webrtc'
@@ -38,6 +39,7 @@ import './App.css'
 type Tab = 'browser' | 'bookmarks' | 'contacts' | 'chat' | 'video' | 'assistant' | 'network'
 
 type ContactDisplay = { id: string; name: string; peerKey: string; proof: string }
+type NetBadgeInfo = { hostname: string; localIp: string; wanIp: string }
 
 const LS_BOOKMARKS = 'holobro-demo-bookmarks'
 const LS_BOOKMARKS_LEGACY = 'hab-demo-bookmarks'
@@ -109,6 +111,11 @@ function App() {
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const [videoPeerB64, setVideoPeerB64] = useState('')
   const [videoLog, setVideoLog] = useState<string[]>([])
+  const [netBadge, setNetBadge] = useState<NetBadgeInfo>({
+    hostname: 'loading…',
+    localIp: '—',
+    wanIp: '—',
+  })
 
   useEffect(() => {
     void (async () => {
@@ -144,6 +151,35 @@ function App() {
   useEffect(() => {
     saveJson(LS_CHAT, demoChat)
   }, [demoChat])
+
+  useEffect(() => {
+    let cancelled = false
+    const refresh = async () => {
+      try {
+        const stats = await invoke<IpStatsResult>('net_ip_stats')
+        if (cancelled) return
+        const localCandidate =
+          stats.interfaces.find((i) => i.family === 'ipv4' && !i.isLoopback)?.addr ||
+          stats.interfaces.find((i) => !i.isLoopback)?.addr ||
+          stats.interfaces[0]?.addr ||
+          '—'
+        setNetBadge({
+          hostname: stats.hostname || '(unknown)',
+          localIp: localCandidate,
+          wanIp: stats.public?.ip || '—',
+        })
+      } catch {
+        if (cancelled) return
+        setNetBadge((p) => ({ ...p, wanIp: 'unavailable' }))
+      }
+    }
+    void refresh()
+    const t = window.setInterval(() => void refresh(), 60_000)
+    return () => {
+      cancelled = true
+      window.clearInterval(t)
+    }
+  }, [])
 
   const refreshThread = useCallback(async () => {
     if (!hc) return
@@ -360,18 +396,21 @@ function App() {
         </nav>
         <main className="main">
           {tab === 'browser' && (
-            <BrowserPanel
-              url={url}
-              setUrl={setUrl}
-              settings={browserSettings}
-              onSettingsChange={setBrowserSettings}
-              onBookmark={() => void addBookmark()}
-              onFetchBridge={() => void fetchReader()}
-              fetchResult={fetchResult}
-              fetchErr={fetchErr}
-              fetchBusy={fetchBusy}
-              active={tab === 'browser'}
-            />
+            <>
+              <BrowserPanel
+                url={url}
+                setUrl={setUrl}
+                settings={browserSettings}
+                onSettingsChange={setBrowserSettings}
+                onBookmark={() => void addBookmark()}
+                onFetchBridge={() => void fetchReader()}
+                fetchResult={fetchResult}
+                fetchErr={fetchErr}
+                fetchBusy={fetchBusy}
+                active={tab === 'browser'}
+              />
+              <IrcDockPanel />
+            </>
           )}
           {tab === 'bookmarks' && (
             <section className="panel">
@@ -505,6 +544,17 @@ function App() {
           {tab === 'network' && <NetworkToolsPanel />}
         </main>
       </div>
+      <aside className="corner-net-badge" aria-label="Current host network identity">
+        <span className="badge-row">
+          <strong>Host</strong> <span className="mono">{netBadge.hostname}</span>
+        </span>
+        <span className="badge-row">
+          <strong>LAN</strong> <span className="mono">{netBadge.localIp}</span>
+        </span>
+        <span className="badge-row">
+          <strong>WAN</strong> <span className="mono">{netBadge.wanIp}</span>
+        </span>
+      </aside>
     </div>
   )
 }

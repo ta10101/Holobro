@@ -1,7 +1,12 @@
-//! Local network diagnostics: interfaces, public IP, traceroute, rough throughput.
+//! Local network diagnostics: interfaces, public IP, traceroute, rough throughput, DNS, BGP, RDAP.
 
 use futures_util::StreamExt;
+use hickory_resolver::config::{ResolverConfig, ResolverOpts};
+use hickory_resolver::proto::rr::RData;
+use hickory_resolver::proto::rr::RecordType;
+use hickory_resolver::TokioAsyncResolver;
 use serde::{Deserialize, Serialize};
+use std::net::IpAddr;
 use std::time::Instant;
 
 #[derive(Debug, Serialize)]
@@ -82,6 +87,29 @@ pub struct SpeedTestResult {
     pub upload_secs: f64,
     pub upload_mbps: f64,
     pub notes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NmapScanReq {
+    pub target: String,
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub ports: Option<String>,
+    #[serde(default)]
+    pub timing: Option<String>,
+    #[serde(default)]
+    pub extra_args: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NmapScanResult {
+    pub command: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -342,5 +370,369 @@ pub async fn net_speed_test(req: SpeedTestReq) -> Result<SpeedTestResult, String
         upload_secs: upload_secs,
         upload_mbps: upload_mbps,
         notes,
+    })
+}
+
+fn nmap_profile_args(profile: &str) -> Vec<&'static str> {
+    match profile {
+        "ping" => vec!["-sn"],
+        "quick" => vec!["-T4", "-F"],
+        "syn" => vec!["-sS"],
+        "udp" => vec!["-sU"],
+        "version" => vec!["-sV"],
+        "os" => vec!["-O"],
+        "aggressive" => vec!["-A"],
+        "full_tcp" => vec!["-p-", "-sV"],
+        "firewalk" => vec!["-Pn", "--traceroute", "--script", "firewalk"],
+        "evasion" => vec!["-Pn", "-f", "--data-length", "25", "--source-port", "53"],
+        "ack_map" => vec!["-sA", "-Pn"],
+        _ => vec!["-sV", "-T4"],
+    }
+}
+
+fn nmap_command_path() -> String {
+    #[cfg(windows)]
+    {
+        let candidates = [
+            r"C:\Program Files\Nmap\nmap.exe",
+            r"C:\Program Files (x86)\Nmap\nmap.exe",
+        ];
+        for c in candidates {
+            if std::path::Path::new(c).exists() {
+                return c.to_string();
+            }
+        }
+        "nmap".to_string()
+    }
+    #[cfg(not(windows))]
+    {
+        "nmap".to_string()
+    }
+}
+
+/// Nmap scan wrapper. Requires `nmap` available on PATH.
+#[tauri::command]
+pub async fn net_nmap_scan(req: NmapScanReq) -> Result<NmapScanResult, String> {
+    let target = req.target.trim();
+    if target.is_empty() {
+        return Err("Target is empty.".into());
+    }
+    if target.len() > 255 {
+        return Err("Target too long.".into());
+    }
+
+    let profile = req
+        .profile
+        .as_deref()
+        .unwrap_or("default")
+        .trim()
+        .to_lowercase();
+    let mut args: Vec<String> = nmap_profile_args(&profile)
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+    if let Some(ports) = req.ports.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        args.push("-p".into());
+        args.push(ports.into());
+    }
+    if let Some(t) = req.timing.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        let timing_ok = matches!(t, "T0" | "T1" | "T2" | "T3" | "T4" | "T5");
+        if !timing_ok {
+            return Err("Timing must be one of T0..T5.".into());
+        }
+        args.push(format!("-{t}"));
+    }
+    if let Some(extra) = req
+        .extra_args
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        for part in extra.split_whitespace() {
+            args.push(part.to_string());
+        }
+    }
+    args.push(target.to_string());
+
+    let nmap_bin = nmap_command_path();
+    let mut cmd = tokio::process::Command::new(&nmap_bin);
+    cmd.args(&args);
+    let command_line = format!("{} {}", nmap_bin, args.join(" "));
+
+    let output = tokio::time::timeout(std::time::Duration::from_secs(600), cmd.output())
+        .await
+        .map_err(|_| "Nmap timed out (600s).".to_string())?
+        .map_err(|e| {
+            format!(
+                "Failed to spawn nmap: {e}. Install Nmap and ensure `nmap` is on PATH."
+            )
+        })?;
+
+    Ok(NmapScanResult {
+        command: command_line,
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+        exit_code: output.status.code(),
+    })
+}
+
+fn dns_resolver() -> TokioAsyncResolver {
+    TokioAsyncResolver::tokio_from_system_conf().unwrap_or_else(|_| {
+        TokioAsyncResolver::tokio(ResolverConfig::cloudflare(), ResolverOpts::default())
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DnsLookupReq {
+    pub name: String,
+    pub record_type: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DnsLookupResult {
+    pub query: String,
+    pub record_type: String,
+    pub lines: Vec<String>,
+    pub notes: Vec<String>,
+}
+
+fn rdata_line(r: &RData) -> String {
+    match r {
+        RData::A(a) => a.to_string(),
+        RData::AAAA(a) => a.to_string(),
+        RData::MX(mx) => format!("{} {}", mx.preference(), mx.exchange()),
+        RData::TXT(txt) => txt
+            .txt_data()
+            .iter()
+            .map(|b| String::from_utf8_lossy(b).into_owned())
+            .collect::<Vec<_>>()
+            .join(""),
+        RData::NS(ns) => ns.to_string(),
+        RData::CNAME(c) => c.to_string(),
+        RData::PTR(ptr) => ptr.to_string(),
+        _ => format!("{r:?}"),
+    }
+}
+
+/// DNS lookup via the OS resolver (hickory), with Cloudflare fallback if system config fails.
+#[tauri::command]
+pub async fn net_dns_lookup(req: DnsLookupReq) -> Result<DnsLookupResult, String> {
+    let name = req.name.trim();
+    if name.is_empty() || name.len() > 253 {
+        return Err("Invalid name (empty or too long).".into());
+    }
+    let rt = req.record_type.trim().to_uppercase();
+    let resolver = dns_resolver();
+    let notes = vec![
+        "Resolver: system DNS when available; otherwise Cloudflare 1.1.1.1.".into(),
+    ];
+
+    let mut lines: Vec<String> = Vec::new();
+
+    match rt.as_str() {
+        "A" => {
+            let l = resolver.ipv4_lookup(name).await.map_err(|e| e.to_string())?;
+            for a in l.iter() {
+                lines.push(a.to_string());
+            }
+        }
+        "AAAA" => {
+            let l = resolver.ipv6_lookup(name).await.map_err(|e| e.to_string())?;
+            for a in l.iter() {
+                lines.push(a.to_string());
+            }
+        }
+        "MX" => {
+            let l = resolver.mx_lookup(name).await.map_err(|e| e.to_string())?;
+            for mx in l.iter() {
+                lines.push(format!("{} {}", mx.preference(), mx.exchange()));
+            }
+        }
+        "TXT" => {
+            let l = resolver.txt_lookup(name).await.map_err(|e| e.to_string())?;
+            for txt in l.iter() {
+                let s: String = txt
+                    .txt_data()
+                    .iter()
+                    .map(|b| String::from_utf8_lossy(b).into_owned())
+                    .collect::<Vec<_>>()
+                    .join("");
+                lines.push(s);
+            }
+        }
+        "NS" => {
+            let l = resolver.ns_lookup(name).await.map_err(|e| e.to_string())?;
+            for ns in l.iter() {
+                lines.push(ns.to_string());
+            }
+        }
+        "CNAME" => {
+            let l = resolver
+                .lookup(name, RecordType::CNAME)
+                .await
+                .map_err(|e| e.to_string())?;
+            for rec in l.record_iter() {
+                if let Some(d) = rec.data() {
+                    lines.push(rdata_line(d));
+                }
+            }
+        }
+        "PTR" => {
+            let ip: IpAddr = name
+                .parse()
+                .map_err(|_| "PTR here means reverse DNS: enter an IPv4 or IPv6 address.".to_string())?;
+            let l = resolver.reverse_lookup(ip).await.map_err(|e| e.to_string())?;
+            for ptr in l.iter() {
+                lines.push(ptr.to_string());
+            }
+        }
+        other => {
+            return Err(format!(
+                "Unsupported record type \"{other}\". Try A, AAAA, MX, TXT, NS, CNAME, or PTR."
+            ));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push("(no records)".into());
+    }
+
+    Ok(DnsLookupResult {
+        query: name.to_string(),
+        record_type: rt,
+        lines,
+        notes,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BgpLookupReq {
+    pub ip: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NetJsonHttpResult {
+    pub url: String,
+    pub status: u16,
+    pub body: String,
+    pub notes: Vec<String>,
+}
+
+async fn fetch_json_like(
+    client: &reqwest::Client,
+    url: &str,
+) -> Result<(u16, String), String> {
+    let res = client.get(url).send().await.map_err(|e| e.to_string())?;
+    let status = res.status().as_u16();
+    let text = res.text().await.map_err(|e| e.to_string())?;
+    let body = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(text),
+        Err(_) => text,
+    };
+    Ok((status, body))
+}
+
+/// BGP / routing snapshot for an IP (BGPView JSON — similar to a looking-glass summary).
+#[tauri::command]
+pub async fn net_bgp_lookup(req: BgpLookupReq) -> Result<NetJsonHttpResult, String> {
+    let ip = req.ip.trim();
+    if ip.is_empty() {
+        return Err("IP is empty.".into());
+    }
+    let _addr: IpAddr = ip
+        .parse()
+        .map_err(|_| "Enter a valid IPv4 or IPv6 address.".to_string())?;
+
+    let client = reqwest::Client::builder()
+        .user_agent("HoloBro-NetTools/0.1")
+        .timeout(std::time::Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::limited(8))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let providers = vec![
+        format!("https://api.bgpview.io/ip/{ip}"),
+        format!("https://stat.ripe.net/data/network-info/data.json?resource={ip}"),
+        format!("https://stat.ripe.net/data/prefix-overview/data.json?resource={ip}"),
+    ];
+    let mut errs = Vec::<String>::new();
+
+    for url in &providers {
+        match fetch_json_like(&client, url).await {
+            Ok((status, body)) => {
+                return Ok(NetJsonHttpResult {
+                    url: url.clone(),
+                    status,
+                    body,
+                    notes: vec![
+                        "BGPView can fail on some DNS/network setups; this tool now falls back to RIPE Stat endpoints."
+                            .into(),
+                        "Data is a public route/ASN snapshot, not an interactive looking glass shell."
+                            .into(),
+                    ],
+                });
+            }
+            Err(e) => errs.push(format!("{url} -> {e}")),
+        }
+    }
+
+    Err(format!(
+        "All BGP providers failed for {ip}. Attempts:\n{}",
+        errs.join("\n")
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RdapLookupReq {
+    /// Domain name (e.g. example.com) or IPv4/IPv6 for RDAP bootstrap at rdap.org.
+    pub query: String,
+}
+
+/// WHOIS-style registration data via RDAP (rdap.org redirector → registry).
+#[tauri::command]
+pub async fn net_rdap_lookup(req: RdapLookupReq) -> Result<NetJsonHttpResult, String> {
+    let q = req.query.trim();
+    if q.is_empty() {
+        return Err("Query is empty.".into());
+    }
+
+    let url = if let Ok(ip) = q.parse::<IpAddr>() {
+        format!("https://rdap.org/ip/{ip}")
+    } else if q.contains('.') && !q.contains('/') && !q.chars().any(|c| c.is_whitespace()) {
+        format!("https://rdap.org/domain/{}", q.to_lowercase())
+    } else {
+        return Err("Enter a domain (e.g. example.com) or IPv4/IPv6 address.".into());
+    };
+
+    let client = reqwest::Client::builder()
+        .user_agent("HoloBro-NetTools/0.1")
+        .timeout(std::time::Duration::from_secs(25))
+        .redirect(reqwest::redirect::Policy::limited(12))
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let res = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let status = res.status().as_u16();
+    let text = res.text().await.map_err(|e| e.to_string())?;
+
+    let body = match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) => serde_json::to_string_pretty(&v).unwrap_or(text),
+        Err(_) => text,
+    };
+
+    Ok(NetJsonHttpResult {
+        url,
+        status,
+        body,
+        notes: vec![
+            "RDAP via rdap.org (redirects to the relevant registry). JSON when the server returns it."
+                .into(),
+        ],
     })
 }

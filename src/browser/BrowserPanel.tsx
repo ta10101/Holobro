@@ -192,6 +192,13 @@ export type BrowserPanelProps = {
   active: boolean
 }
 
+type ShellExecResult = {
+  command: string
+  stdout: string
+  stderr: string
+  exitCode: number | null
+}
+
 export function BrowserPanel({
   url,
   setUrl,
@@ -213,6 +220,12 @@ export function BrowserPanel({
   const [status, setStatus] = useState('Embedded page area below — click Go to load.')
   const [clipboardNote, setClipboardNote] = useState<string | null>(null)
   const [fetchPreviewExpanded, setFetchPreviewExpanded] = useState(false)
+  const [termCommand, setTermCommand] = useState('ipconfig')
+  const [termCwd, setTermCwd] = useState('')
+  const [termBusy, setTermBusy] = useState(false)
+  const [termOut, setTermOut] = useState<ShellExecResult | null>(null)
+  const [termErr, setTermErr] = useState<string | null>(null)
+  const [termHistory, setTermHistory] = useState<string[]>([])
 
   useEffect(() => {
     if (!clipboardNote) return
@@ -390,6 +403,11 @@ export function BrowserPanel({
       if (mod && e.key.toLowerCase() === 'p') {
         e.preventDefault()
         void invoke('content_webview_print')
+          .then(() => setStatus('Print dialog requested.'))
+          .catch((e) => {
+            const msg = e instanceof Error ? e.message : String(e)
+            setStatus(`Print failed: ${msg}`)
+          })
         return
       }
 
@@ -446,12 +464,46 @@ export function BrowserPanel({
     setClipboardNote(ok ? 'Address copied' : 'Copy failed')
   }
 
+  const triggerPrint = useCallback(async () => {
+    try {
+      await invoke('content_webview_print')
+      setStatus('Print dialog requested.')
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setStatus(`Print failed: ${msg}`)
+    }
+  }, [])
+
   const fetchBodyPreview = fetchResult
     ? fetchPreviewExpanded
       ? fetchResult.body
       : fetchResult.body.slice(0, PREVIEW_LIMIT) +
         (fetchResult.body.length > PREVIEW_LIMIT ? '…' : '')
     : ''
+
+  const runTerminal = useCallback(async () => {
+    setTermBusy(true)
+    setTermErr(null)
+    setTermOut(null)
+    try {
+      const r = await invoke<ShellExecResult>('shell_exec', {
+        req: {
+          command: termCommand,
+          cwd: termCwd.trim() || undefined,
+          timeoutSecs: 90,
+        },
+      })
+      setTermOut(r)
+      setTermHistory((prev) => {
+        const cleaned = prev.filter((x) => x !== termCommand)
+        return [termCommand, ...cleaned].slice(0, 12)
+      })
+    } catch (e) {
+      setTermErr(String(e))
+    } finally {
+      setTermBusy(false)
+    }
+  }, [termCommand, termCwd])
 
   return (
     <section className="panel browser-panel">
@@ -527,7 +579,7 @@ export function BrowserPanel({
           >
             Find
           </button>
-          <button type="button" title="Print (Ctrl+P)" onClick={() => void invoke('content_webview_print')}>
+          <button type="button" title="Print (Ctrl+P)" onClick={() => void triggerPrint()}>
             Print
           </button>
           <button type="button" onClick={() => setSettingsOpen(true)}>
@@ -651,6 +703,52 @@ export function BrowserPanel({
           <pre className="reader fetch-reader">{fetchBodyPreview}</pre>
         </div>
       )}
+
+      <section className="browser-terminal">
+        <h3>Terminal</h3>
+        <p className="hint">Run shell commands without leaving the browser tab.</p>
+        <div className="row">
+          {termHistory.length ? (
+            <label>
+              History
+              <select value="" onChange={(e) => e.target.value && setTermCommand(e.target.value)}>
+                <option value="">Recent commands…</option>
+                {termHistory.map((cmd) => (
+                  <option key={cmd} value={cmd}>
+                    {cmd}
+                  </option>
+                ))}
+              </select>
+            </label>
+          ) : null}
+          <input
+            className="wide"
+            value={termCommand}
+            onChange={(e) => setTermCommand(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && void runTerminal()}
+            placeholder="Command (e.g. ipconfig /all, nmap -sV scanme.nmap.org)"
+          />
+          <input
+            value={termCwd}
+            onChange={(e) => setTermCwd(e.target.value)}
+            placeholder="Working directory (optional)"
+          />
+          <button type="button" disabled={termBusy} onClick={() => void runTerminal()}>
+            {termBusy ? 'Running…' : 'Run'}
+          </button>
+        </div>
+        {termErr ? <p className="error">{termErr}</p> : null}
+        {termOut ? (
+          <div className="network-trace-out">
+            <p className="muted mono network-trace-cmd">{termOut.command}</p>
+            {termOut.exitCode !== null && termOut.exitCode !== 0 ? (
+              <p className="error">Exit code {termOut.exitCode}</p>
+            ) : null}
+            <pre className="network-pre network-pre-large">{termOut.stdout || '(no stdout)'}</pre>
+            {termOut.stderr ? <pre className="network-pre network-pre-err">{termOut.stderr}</pre> : null}
+          </div>
+        ) : null}
+      </section>
 
       {settingsOpen && (
         <div

@@ -1,4 +1,5 @@
 mod network_tools;
+mod irc_tools;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -307,13 +308,32 @@ async fn content_webview_stop(app: tauri::AppHandle) -> Result<(), String> {
 async fn content_webview_set_zoom(app: tauri::AppHandle, scale: f64) -> Result<(), String> {
     let w = content_webview(&app).ok_or_else(|| "No embedded page yet.".to_string())?;
     let s = scale.clamp(0.25, 4.0);
-    w.set_zoom(s).map_err(|e| e.to_string())
+    match w.set_zoom(s) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            // Fallback for environments where native zoom on child WebView2 is unreliable.
+            let js = format!(
+                "(function(){{\
+                    var z={s};\
+                    try{{document.documentElement.style.zoom=String(z);}}catch(_e){{}}\
+                    try{{document.body && (document.body.style.zoom=String(z));}}catch(_e){{}}\
+                    try{{document.documentElement.style.transformOrigin='0 0';}}catch(_e){{}}\
+                }})();"
+            );
+            w.eval(js).map_err(|e| e.to_string())
+        }
+    }
 }
 
 #[tauri::command]
 async fn content_webview_print(app: tauri::AppHandle) -> Result<(), String> {
     let w = content_webview(&app).ok_or_else(|| "No embedded page yet.".to_string())?;
-    w.print().map_err(|e| e.to_string())
+    w.show().map_err(|e| e.to_string())?;
+    w.set_focus().map_err(|e| e.to_string())?;
+    match w.print() {
+        Ok(()) => Ok(()),
+        Err(_) => w.eval("window.print();").map_err(|e| e.to_string()),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -394,6 +414,25 @@ pub struct FetchBridgeRequest {
     pub max_bytes: Option<usize>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellExecRequest {
+    pub command: String,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ShellExecResult {
+    pub command: String,
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_code: Option<i32>,
+}
+
 /// Clearnet HTTP bridge: fetch a URL from the Tauri host. Optional `proxy` uses SOCKS5 for Tor, etc.
 #[tauri::command]
 async fn fetch_url_bridge(req: FetchBridgeRequest) -> Result<FetchBridgeResult, String> {
@@ -449,6 +488,42 @@ async fn fetch_url_bridge(req: FetchBridgeRequest) -> Result<FetchBridgeResult, 
         content_type,
         final_url,
         byte_length,
+    })
+}
+
+/// Execute a shell command and return output for the in-app terminal panel.
+#[tauri::command]
+async fn shell_exec(req: ShellExecRequest) -> Result<ShellExecResult, String> {
+    let command = req.command.trim();
+    if command.is_empty() {
+        return Err("Command is empty.".into());
+    }
+
+    let timeout = req.timeout_secs.unwrap_or(45).clamp(1, 180);
+    let mut cmd = if cfg!(windows) {
+        let mut c = tokio::process::Command::new("cmd");
+        c.arg("/C").arg(command);
+        c
+    } else {
+        let mut c = tokio::process::Command::new("sh");
+        c.arg("-lc").arg(command);
+        c
+    };
+
+    if let Some(cwd) = req.cwd.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        cmd.current_dir(cwd);
+    }
+
+    let out = tokio::time::timeout(Duration::from_secs(timeout), cmd.output())
+        .await
+        .map_err(|_| format!("Command timed out ({timeout}s)."))?
+        .map_err(|e| format!("Failed to spawn command: {e}"))?;
+
+    Ok(ShellExecResult {
+        command: command.to_string(),
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        exit_code: out.status.code(),
     })
 }
 
@@ -800,13 +875,23 @@ pub fn run() {
             content_webview_show,
             content_webview_focus,
             fetch_url_bridge,
+            shell_exec,
             llm_health,
             llm_list_models,
             llm_pull_ollama,
             llm_chat,
             network_tools::net_ip_stats,
             network_tools::net_traceroute,
-            network_tools::net_speed_test
+            network_tools::net_speed_test,
+            network_tools::net_dns_lookup,
+            network_tools::net_bgp_lookup,
+            network_tools::net_rdap_lookup,
+            network_tools::net_nmap_scan,
+            irc_tools::irc_connect,
+            irc_tools::irc_send,
+            irc_tools::irc_join,
+            irc_tools::irc_disconnect,
+            irc_tools::irc_poll
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
