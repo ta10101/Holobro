@@ -2,7 +2,7 @@
 
 **HoloBro** is a **local-first desktop shell**: **Tauri + React** for the UI, optional **Holochain** for bookmarks, contacts, chat, and WebRTC signaling, plus an embedded **WebView2** / **WebKit** browser, HTTP fetch bridge, LLM assistant hooks, and **network tools** (IP stats, traceroute, rough speed check).
 
-Repository: **[github.com/ta10101/HoloBro](https://github.com/ta10101/HoloBro)**
+Repository: **[github.com/ta10101/Holobro](https://github.com/ta10101/Holobro)** (GitHub may redirect from `HoloBro`.)
 
 > This project is a **scaffold**. Strong anonymity guarantees, production-grade chat encryption, TURN for WebRTC, and fully hardened web isolation are follow-on work.
 
@@ -22,7 +22,7 @@ Repository: **[github.com/ta10101/HoloBro](https://github.com/ta10101/HoloBro)**
 
 ## Install prebuilt binaries
 
-When [GitHub Releases](https://github.com/ta10101/HoloBro/releases) publishes assets, download the file that matches your OS and CPU.
+When [GitHub Releases](https://github.com/ta10101/Holobro/releases) publishes assets, download the file that matches your OS and CPU.
 
 ### Windows (x64)
 

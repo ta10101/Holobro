@@ -6,12 +6,12 @@
   "description": "HoloBro — Tauri + Holochain browser shell (bookmarks, chat, embedded WebView2, network tools)",
   "repository": {
     "type": "git",
-    "url": "https://github.com/ta10101/HoloBro.git"
+    "url": "https://github.com/ta10101/Holobro.git"
   },
   "bugs": {
-    "url": "https://github.com/ta10101/HoloBro/issues"
+    "url": "https://github.com/ta10101/Holobro/issues"
   },
-  "homepage": "https://github.com/ta10101/HoloBro#readme",
+  "homepage": "https://github.com/ta10101/Holobro#readme",
   "scripts": {
     "dev": "vite",
     "build": "tsc && vite build",
