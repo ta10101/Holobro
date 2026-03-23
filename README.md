@@ -1,4 +1,5 @@
 <p align="center">
+  <img src="./public/holobro-logo.svg" alt="HoloBro logo" width="118" />
   <img src="./public/holobro-mascot.svg" alt="HoloBro mascot logo" width="170" />
 </p>
 <h1 align="center">HoloBro</h1>
