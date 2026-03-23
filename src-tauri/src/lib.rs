@@ -223,23 +223,27 @@ async fn content_webview_ensure(app: tauri::AppHandle, req: ContentWebviewEnsure
 
     let fp = privacy_fingerprint(&privacy);
     if let Some(w) = content_webview(&app) {
-        let guard = last_content_privacy_fp()
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let same = guard.as_ref() == Some(&fp);
-        if same {
-            w.navigate(parsed).map_err(|e| e.to_string())?;
-            w.set_position(LogicalPosition::new(bounds.x, bounds.y))
-                .map_err(|e| e.to_string())?;
-            w.set_size(LogicalSize::new(bounds.width, bounds.height))
-                .map_err(|e| e.to_string())?;
-            w.show().map_err(|e| e.to_string())?;
-            return Ok(());
+        let same = {
+            let guard = last_content_privacy_fp()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            guard.as_ref() == Some(&fp)
+        };
+        if !same {
+            // Re-apply best-effort privacy script at runtime; this avoids close/recreate deadlocks.
+            let js = privacy_init_script(privacy.block_webrtc, privacy.block_ads, privacy.block_scripts);
+            let _ = w.eval(js);
         }
-        let _ = w.close();
+        w.navigate(parsed).map_err(|e| e.to_string())?;
+        w.set_position(LogicalPosition::new(bounds.x, bounds.y))
+            .map_err(|e| e.to_string())?;
+        w.set_size(LogicalSize::new(bounds.width, bounds.height))
+            .map_err(|e| e.to_string())?;
+        w.show().map_err(|e| e.to_string())?;
         if let Ok(mut g) = last_content_privacy_fp().lock() {
-            *g = None;
+            *g = Some(fp);
         }
+        return Ok(());
     }
 
     let webview_url = WebviewUrl::External(parsed);

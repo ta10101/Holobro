@@ -214,6 +214,8 @@ export function BrowserPanel({
   fetchBusy,
   active,
 }: BrowserPanelProps) {
+  const openInFlightRef = useRef(false)
+  const queuedSettingsRef = useRef<BrowserSettings | null>(null)
   const surfaceRef = useRef<HTMLDivElement>(null)
   const findInputRef = useRef<HTMLInputElement>(null)
   const [settingsOpen, setSettingsOpen] = useState(false)
@@ -344,7 +346,7 @@ export function BrowserPanel({
     [findQuery, findCase],
   )
 
-  const openPage = async (settingsOverride?: BrowserSettings) => {
+  const openPageOnce = async (settingsOverride?: BrowserSettings) => {
     const s = settingsOverride ?? settings
     const u = normalizeUrl(url)
     setUrl(u)
@@ -381,6 +383,25 @@ export function BrowserPanel({
       setStatus(`Embed failed: ${msg}`)
     }
   }
+
+  const openPage = useCallback(async (settingsOverride?: BrowserSettings) => {
+    const requested = settingsOverride ?? settings
+    if (openInFlightRef.current) {
+      queuedSettingsRef.current = requested
+      return
+    }
+    openInFlightRef.current = true
+    let current: BrowserSettings | null = requested
+    try {
+      while (current) {
+        queuedSettingsRef.current = null
+        await openPageOnce(current)
+        current = queuedSettingsRef.current
+      }
+    } finally {
+      openInFlightRef.current = false
+    }
+  }, [settings, url, setUrl, readBounds, syncBounds])
 
   useEffect(() => {
     if (!active) return
