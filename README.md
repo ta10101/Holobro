@@ -15,6 +15,7 @@ Repository: **[github.com/ta10101/Holobro](https://github.com/ta10101/Holobro)**
 
 ## Table of contents
 
+- [Screenshots](#screenshots)  
 - [Install prebuilt binaries](#install-prebuilt-binaries) (Windows · macOS · Linux)  
 - [Uninstall](#uninstall) (including uninstallers)  
 - [Build from source](#build-from-source)  
@@ -22,6 +23,19 @@ Repository: **[github.com/ta10101/Holobro](https://github.com/ta10101/Holobro)**
 - [Features](#features)  
 - [Project layout](#project-layout)  
 - [License](#license)
+
+---
+
+## Screenshots
+
+<p align="center">
+  <img src="./public/screenshots/browser.png" alt="HoloBro browser with privacy controls and embedded webview" width="46%" />
+  <img src="./public/screenshots/weather.png" alt="HoloBro weather panel with forecast and humor pack" width="46%" />
+</p>
+<p align="center">
+  <img src="./public/screenshots/settings.png" alt="HoloBro browser settings modal with privacy toggles" width="46%" />
+  <img src="./public/screenshots/assistant.png" alt="HoloBro assistant panel with local Ollama configuration" width="46%" />
+</p>
 
 ---
 
