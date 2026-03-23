@@ -16,7 +16,8 @@ export default defineConfig(async () => ({
   server: {
     port: 1420,
     strictPort: true,
-    host: host || false,
+    // Use 127.0.0.1 on Windows so WebView2 matches Vite (localhost → ::1 can break dev load).
+    host: host || "127.0.0.1",
     hmr: host
       ? {
           protocol: "ws",

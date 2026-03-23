@@ -342,10 +342,16 @@ async fn content_webview_find(app: tauri::AppHandle, args: FindInPageArgs) -> Re
     w.eval(js).map_err(|e| e.to_string())
 }
 
+/// Move the embedded webview off-screen instead of `hide()`. On Windows, WebView2 `hide()` can leave the
+/// control unable to receive clicks after `show()` when switching tabs; collapsing preserves input behavior.
 #[tauri::command]
 async fn content_webview_hide(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(w) = content_webview(&app) {
-        w.hide().map_err(|e| e.to_string())?;
+        w.show().map_err(|e| e.to_string())?;
+        w.set_position(LogicalPosition::new(-32_000.0, -32_000.0))
+            .map_err(|e| e.to_string())?;
+        w.set_size(LogicalSize::new(1.0, 1.0))
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -354,6 +360,15 @@ async fn content_webview_hide(app: tauri::AppHandle) -> Result<(), String> {
 async fn content_webview_show(app: tauri::AppHandle) -> Result<(), String> {
     if let Some(w) = content_webview(&app) {
         w.show().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Focus the embedded page webview (needed after show/hide so clicks hit the page, not the shell).
+#[tauri::command]
+async fn content_webview_focus(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(w) = content_webview(&app) {
+        w.set_focus().map_err(|e| e.to_string())?;
     }
     Ok(())
 }
@@ -783,6 +798,7 @@ pub fn run() {
             content_webview_find,
             content_webview_hide,
             content_webview_show,
+            content_webview_focus,
             fetch_url_bridge,
             llm_health,
             llm_list_models,

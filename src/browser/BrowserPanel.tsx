@@ -224,6 +224,11 @@ export function BrowserPanel({
     setFetchPreviewExpanded(false)
   }, [fetchResult])
 
+  // Persist every change (proxy Off, etc.) — avoids relying on the modal Save button alone.
+  useEffect(() => {
+    saveBrowserSettings(settings)
+  }, [settings])
+
   const readBounds = useCallback(() => {
     const el = surfaceRef.current
     if (!el) return null
@@ -241,6 +246,20 @@ export function BrowserPanel({
     }
   }, [readBounds])
 
+  // Native child WebView2 stacks above HTML; while Settings is open it would steal every click (Save/Close dead).
+  // Park it off-screen until the modal closes, then restore bounds.
+  useEffect(() => {
+    if (!active) return
+    if (settingsOpen) {
+      void invoke('content_webview_hide').catch(() => {})
+      return
+    }
+    void invoke('content_webview_show').catch(() => {})
+    void syncBounds()
+    const t = window.setTimeout(() => void syncBounds(), 80)
+    return () => window.clearTimeout(t)
+  }, [settingsOpen, active, syncBounds])
+
   useLayoutEffect(() => {
     if (!active) return
     void syncBounds()
@@ -255,13 +274,34 @@ export function BrowserPanel({
     }
   }, [active, syncBounds])
 
+  // Park native child webview off-screen when leaving this tab (see Rust: avoid WebView2 hide()).
+  // Re-sync bounds when returning — do not call content_webview_focus here; it steals focus from the URL bar.
   useEffect(() => {
     if (!active) {
       void invoke('content_webview_hide').catch(() => {})
       return
     }
-    void invoke('content_webview_show').catch(() => {})
-    void syncBounds()
+    let cancelled = false
+    let timeoutId: ReturnType<typeof setTimeout> | undefined
+
+    const bump = async () => {
+      await invoke('content_webview_show').catch(() => {})
+      await syncBounds()
+      await new Promise<void>((r) => requestAnimationFrame(() => r()))
+      if (cancelled) return
+      await syncBounds()
+      timeoutId = window.setTimeout(() => {
+        if (cancelled) return
+        void syncBounds()
+      }, 120)
+    }
+    void bump()
+
+    return () => {
+      cancelled = true
+      if (timeoutId !== undefined) window.clearTimeout(timeoutId)
+      void invoke('content_webview_hide').catch(() => {})
+    }
   }, [active, syncBounds])
 
   const applyZoom = useCallback(
@@ -317,6 +357,7 @@ export function BrowserPanel({
         },
       })
       await invoke('content_webview_set_zoom', { scale: settings.zoom })
+      await syncBounds()
       setStatus(
         isContentProxyActive(settings)
           ? `Loaded via proxy (${settings.contentProxyPreset}): ${u}`
@@ -612,8 +653,16 @@ export function BrowserPanel({
       )}
 
       {settingsOpen && (
-        <div className="modal-backdrop" role="dialog" aria-modal="true" aria-label="Browser settings">
-          <div className="modal modal-wide">
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Browser settings"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setSettingsOpen(false)
+          }}
+        >
+          <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
             <h3>Browser settings</h3>
             <div className="settings-grid">
               <h4 className="settings-sub">Embedded page (privacy)</h4>
@@ -746,8 +795,9 @@ export function BrowserPanel({
                   saveBrowserSettings(settings)
                   setSettingsOpen(false)
                 }}
+                title="Settings are also saved as you change them. Press Go on the Browser tab to apply proxy/privacy to the embedded page."
               >
-                Save
+                Save & close
               </button>
               <button type="button" onClick={() => setSettingsOpen(false)}>
                 Close
