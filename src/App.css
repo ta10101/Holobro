@@ -675,6 +675,16 @@ button.toggle.active {
   max-width: 120px;
 }
 
+.settings-grid select,
+.proxy-preset-label select {
+  padding: 0.45rem 0.55rem;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: #0c1018;
+  color: var(--text);
+  font-size: 0.9rem;
+}
+
 /* Assistant / LLM */
 .assistant-panel {
   max-width: 760px;

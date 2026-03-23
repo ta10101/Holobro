@@ -2,10 +2,20 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import { invoke } from '@tauri-apps/api/core'
 import { openUrl } from '@tauri-apps/plugin-opener'
 
+/** Embedded page proxy: Off, Tor SOCKS, [AN.ON / JonDo / JAP](https://anon.inf.tu-dresden.de/index_en.html) local HTTP, or arbitrary URL. */
+export type ContentProxyPreset = 'off' | 'tor' | 'jondo' | 'custom'
+
 export type BrowserSettings = {
   zoom: number
-  /** Shared SOCKS/HTTP URL for Fetch bridge and (optionally) embedded page. */
+  /** Tor / SOCKS or custom HTTP/SOCKS URL (used when preset is `tor` or `custom`). */
   torProxyUrl: string
+  /**
+   * JonDo / JAP local HTTP proxy when preset is `jondo` (JonDo often defaults to port 4001 — check your client).
+   * @see https://anon.inf.tu-dresden.de/index_en.html
+   */
+  jondoProxyUrl: string
+  /** Route embedded page through selected proxy; choose `off` for a normal direct connection. */
+  contentProxyPreset: ContentProxyPreset
   useProxyForFetch: boolean
   /** HTTP bridge request timeout (seconds). */
   fetchTimeoutSecs: number
@@ -15,10 +25,58 @@ export type BrowserSettings = {
   stealthUserAgent: boolean
   /** Document-start script: block WebRTC constructors & lock down getUserMedia (best-effort). */
   privacyHardenContent: boolean
-  /** Send embedded WebView2 traffic through this proxy (e.g. Tor SOCKS). Re-Go after toggling. */
-  useProxyForContent: boolean
   /** Non-persistent WebView2 profile for the embedded page. */
   contentIncognito: boolean
+}
+
+const JONDO_DEFAULT_HTTP = 'http://127.0.0.1:4001'
+
+export function isContentProxyActive(s: BrowserSettings): boolean {
+  return s.contentProxyPreset !== 'off'
+}
+
+/** URL passed to WebView2 / fetch bridge when a proxy preset is active. */
+export function effectiveContentProxyUrl(s: BrowserSettings): string {
+  switch (s.contentProxyPreset) {
+    case 'jondo':
+      return (s.jondoProxyUrl.trim() || JONDO_DEFAULT_HTTP)
+    case 'tor':
+    case 'custom':
+      return (s.torProxyUrl.trim() || 'socks5://127.0.0.1:9050')
+    default:
+      return s.torProxyUrl.trim() || 'socks5://127.0.0.1:9050'
+  }
+}
+
+function migrateLegacyContentProxy(p: Partial<BrowserSettings> & { useProxyForContent?: boolean }): {
+  preset: ContentProxyPreset
+  jondoUrl: string
+} {
+  if (
+    typeof p.contentProxyPreset === 'string' &&
+    ['off', 'tor', 'jondo', 'custom'].includes(p.contentProxyPreset)
+  ) {
+    return {
+      preset: p.contentProxyPreset as ContentProxyPreset,
+      jondoUrl:
+        typeof p.jondoProxyUrl === 'string' && p.jondoProxyUrl.trim()
+          ? p.jondoProxyUrl.trim()
+          : JONDO_DEFAULT_HTTP,
+    }
+  }
+  if (!p.useProxyForContent) {
+    return { preset: 'off', jondoUrl: JONDO_DEFAULT_HTTP }
+  }
+  const u = (p.torProxyUrl || '').trim().toLowerCase()
+  if (u.startsWith('socks')) return { preset: 'tor', jondoUrl: JONDO_DEFAULT_HTTP }
+  if (u.startsWith('http')) {
+    const legacyHttp = (p.torProxyUrl || '').trim()
+    if (u.includes(':4001') || u.includes('jondo') || u.includes('jap')) {
+      return { preset: 'jondo', jondoUrl: legacyHttp || JONDO_DEFAULT_HTTP }
+    }
+    return { preset: 'custom', jondoUrl: JONDO_DEFAULT_HTTP }
+  }
+  return { preset: 'custom', jondoUrl: JONDO_DEFAULT_HTTP }
 }
 
 export type FetchBridgeResult = {
@@ -55,19 +113,26 @@ export function loadBrowserSettings(): BrowserSettings {
       return {
         zoom: 1,
         torProxyUrl: 'socks5://127.0.0.1:9050',
+        jondoProxyUrl: JONDO_DEFAULT_HTTP,
+        contentProxyPreset: 'off',
         useProxyForFetch: false,
         fetchTimeoutSecs: 45,
         fetchMaxKb: 2048,
         stealthUserAgent: true,
         privacyHardenContent: true,
-        useProxyForContent: false,
         contentIncognito: true,
       }
     }
-    const p = JSON.parse(raw) as Partial<BrowserSettings>
+    const p = JSON.parse(raw) as Partial<BrowserSettings> & { useProxyForContent?: boolean }
+    const { preset: contentProxyPreset, jondoUrl: migratedJondo } = migrateLegacyContentProxy(p)
     return {
       zoom: typeof p.zoom === 'number' ? Math.min(2, Math.max(0.5, p.zoom)) : 1,
       torProxyUrl: typeof p.torProxyUrl === 'string' ? p.torProxyUrl : 'socks5://127.0.0.1:9050',
+      jondoProxyUrl:
+        typeof p.jondoProxyUrl === 'string' && p.jondoProxyUrl.trim()
+          ? p.jondoProxyUrl.trim()
+          : migratedJondo,
+      contentProxyPreset,
       useProxyForFetch: Boolean(p.useProxyForFetch),
       fetchTimeoutSecs:
         typeof p.fetchTimeoutSecs === 'number'
@@ -77,19 +142,19 @@ export function loadBrowserSettings(): BrowserSettings {
         typeof p.fetchMaxKb === 'number' ? Math.min(2048, Math.max(16, Math.round(p.fetchMaxKb))) : 2048,
       stealthUserAgent: typeof p.stealthUserAgent === 'boolean' ? p.stealthUserAgent : true,
       privacyHardenContent: typeof p.privacyHardenContent === 'boolean' ? p.privacyHardenContent : true,
-      useProxyForContent: typeof p.useProxyForContent === 'boolean' ? p.useProxyForContent : false,
       contentIncognito: typeof p.contentIncognito === 'boolean' ? p.contentIncognito : true,
     }
   } catch {
     return {
       zoom: 1,
       torProxyUrl: 'socks5://127.0.0.1:9050',
+      jondoProxyUrl: JONDO_DEFAULT_HTTP,
+      contentProxyPreset: 'off',
       useProxyForFetch: false,
       fetchTimeoutSecs: 45,
       fetchMaxKb: 2048,
       stealthUserAgent: true,
       privacyHardenContent: true,
-      useProxyForContent: false,
       contentIncognito: true,
     }
   }
@@ -245,16 +310,16 @@ export function BrowserPanel({
           privacy: {
             stealthUserAgent: settings.stealthUserAgent,
             blockWebrtc: settings.privacyHardenContent,
-            useProxy: settings.useProxyForContent,
-            proxyUrl: settings.torProxyUrl,
+            useProxy: isContentProxyActive(settings),
+            proxyUrl: effectiveContentProxyUrl(settings),
             incognito: settings.contentIncognito,
           },
         },
       })
       await invoke('content_webview_set_zoom', { scale: settings.zoom })
       setStatus(
-        settings.useProxyForContent
-          ? `Loaded via proxy: ${u}`
+        isContentProxyActive(settings)
+          ? `Loaded via proxy (${settings.contentProxyPreset}): ${u}`
           : `Loaded in app: ${u}`,
       )
     } catch (e) {
@@ -470,9 +535,12 @@ export function BrowserPanel({
             Stealth UA
           </span>
         ) : null}
-        {settings.useProxyForContent ? (
-          <span className="privacy-badge proxy" title="Embedded page uses SOCKS/HTTP proxy">
-            Proxy page
+        {isContentProxyActive(settings) ? (
+          <span
+            className="privacy-badge proxy"
+            title={`Embedded page uses proxy (${settings.contentProxyPreset})`}
+          >
+            Proxy: {settings.contentProxyPreset}
           </span>
         ) : null}
       </div>
@@ -483,9 +551,13 @@ export function BrowserPanel({
         {clipboardNote ? <span className="clipboard-toast"> {clipboardNote}</span> : null}
       </p>
       <p className="hint">
-        <strong>Stronger anonymity:</strong> start Tor (SOCKS, often port 9050), enable <em>Route embedded page
-        through proxy</em> in Settings, then <strong>Go</strong> again so the webview rebuilds. Hardening reduces
-        WebRTC-style IP leaks but cannot guarantee invisibility against every fingerprint test.
+        <strong>Stronger anonymity:</strong> run a local proxy (Tor SOCKS, or{' '}
+        <a href="https://anon.inf.tu-dresden.de/index_en.html" target="_blank" rel="noreferrer">
+          AN.ON / JAP / JonDo
+        </a>{' '}
+        HTTP proxy), set <em>Embedded page → mix / proxy</em> in Settings, then <strong>Go</strong> again so the
+        webview rebuilds. Choose <strong>Off</strong> there to browse directly. Hardening reduces WebRTC-style IP
+        leaks; this is not Tor Browser–grade anonymity.
       </p>
 
       <div ref={surfaceRef} className="browser-surface" />
@@ -569,28 +641,58 @@ export function BrowserPanel({
                 />
                 Incognito embedded profile (non-persistent)
               </label>
-              <label className="check">
-                <input
-                  type="checkbox"
-                  checked={settings.useProxyForContent}
-                  onChange={(e) => onSettingsChange({ ...settings, useProxyForContent: e.target.checked })}
-                />
-                Route embedded page through SOCKS/HTTP proxy (Tor)
+              <label className="proxy-preset-label">
+                Embedded page → mix / proxy
+                <select
+                  value={settings.contentProxyPreset}
+                  onChange={(e) =>
+                    onSettingsChange({
+                      ...settings,
+                      contentProxyPreset: e.target.value as ContentProxyPreset,
+                    })
+                  }
+                >
+                  <option value="off">Off — direct connection (no proxy)</option>
+                  <option value="tor">Tor — SOCKS5 (local Tor, e.g. port 9050)</option>
+                  <option value="jondo">AN.ON / JonDo / JAP — local HTTP proxy (mix cascades)</option>
+                  <option value="custom">Custom — any HTTP or SOCKS URL below</option>
+                </select>
               </label>
+              {settings.contentProxyPreset === 'jondo' ? (
+                <label>
+                  JonDo / JAP local HTTP proxy URL
+                  <input
+                    value={settings.jondoProxyUrl}
+                    onChange={(e) => onSettingsChange({ ...settings, jondoProxyUrl: e.target.value })}
+                    placeholder={JONDO_DEFAULT_HTTP}
+                  />
+                </label>
+              ) : settings.contentProxyPreset === 'tor' || settings.contentProxyPreset === 'custom' ? (
+                <label>
+                  {settings.contentProxyPreset === 'tor' ? 'Tor / SOCKS5 URL' : 'Custom proxy URL (HTTP or SOCKS5)'}
+                  <input
+                    value={settings.torProxyUrl}
+                    onChange={(e) => onSettingsChange({ ...settings, torProxyUrl: e.target.value })}
+                    placeholder={
+                      settings.contentProxyPreset === 'tor'
+                        ? 'socks5://127.0.0.1:9050'
+                        : 'http://127.0.0.1:8080 or socks5://…'
+                    }
+                  />
+                </label>
+              ) : null}
               <p className="hint">
-                After changing these, press <strong>Go</strong> once — the embedded webview is recreated when privacy
-                settings change.
+                <strong>AN.ON / JAP:</strong> install and start{' '}
+                <a href="https://anon.inf.tu-dresden.de/index_en.html" target="_blank" rel="noreferrer">
+                  JAP or JonDo
+                </a>
+                , note the <strong>local HTTP proxy</strong> host/port in the client (JonDo often uses{' '}
+                <code>127.0.0.1:4001</code> — yours may differ), set preset to <em>AN.ON / JonDo</em>, then{' '}
+                <strong>Go</strong>. Set to <em>Off</em> to disable. After changing these, press <strong>Go</strong>{' '}
+                once — the embedded webview is recreated when privacy settings change.
               </p>
 
               <h4 className="settings-sub">Network</h4>
-              <label>
-                Tor / SOCKS (or HTTP) proxy URL
-                <input
-                  value={settings.torProxyUrl}
-                  onChange={(e) => onSettingsChange({ ...settings, torProxyUrl: e.target.value })}
-                  placeholder="socks5://127.0.0.1:9050"
-                />
-              </label>
               <label className="check">
                 <input
                   type="checkbox"
@@ -633,9 +735,9 @@ export function BrowserPanel({
               </label>
             </div>
             <p className="hint">
-              With <strong>Route embedded page through proxy</strong> + Tor running, page traffic can exit via Tor
-              (verify on check sites). DNS and advanced leaks may still differ from Tor Browser; this is
-              best-effort hardening, not a formal anonymity tool.
+              With a non-<strong>Off</strong> preset and a running local proxy (Tor, JonDo/JAP, etc.), embedded
+              traffic exits through that path. DNS and advanced leaks may still differ from a dedicated anonymity
+              browser; this remains best-effort hardening, not a formal anonymity guarantee.
             </p>
             <div className="modal-actions">
               <button

@@ -8,6 +8,8 @@ import { invoke } from '@tauri-apps/api/core'
 import { tryConnectHolo } from './holochainConnect'
 import {
   BrowserPanel,
+  effectiveContentProxyUrl,
+  isContentProxyActive,
   loadBrowserSettings,
   type BrowserSettings,
   type FetchBridgeResult,
@@ -163,8 +165,8 @@ function App() {
     setFetchBusy(true)
     const u = normalizeUrl(url)
     const proxy =
-      browserSettings.useProxyForFetch && browserSettings.torProxyUrl.trim()
-        ? browserSettings.torProxyUrl.trim()
+      browserSettings.useProxyForFetch && isContentProxyActive(browserSettings)
+        ? effectiveContentProxyUrl(browserSettings)
         : null
     try {
       const result = await invoke<FetchBridgeResult>('fetch_url_bridge', {
