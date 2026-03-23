@@ -1,4 +1,8 @@
-# HoloBro
+<p align="center">
+  <img src="./public/holobro-mascot.svg" alt="HoloBro mascot logo" width="170" />
+</p>
+<h1 align="center">HoloBro</h1>
+<p align="center"><strong>Street-skater cyberpunk browser shell.</strong></p>
 
 **HoloBro** is a **local-first desktop shell**: **Tauri + React** for the UI, optional **Holochain** for bookmarks, contacts, chat, and WebRTC signaling, plus an embedded **WebView2** / **WebKit** browser, HTTP fetch bridge, LLM assistant hooks, and **network tools** (IP stats, traceroute, rough speed check).
 

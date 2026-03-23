@@ -229,8 +229,6 @@ export function NetworkToolsPanel() {
   const [nmapBusy, setNmapBusy] = useState(false)
   const [nmapErr, setNmapErr] = useState<string | null>(null)
   const [nmapOut, setNmapOut] = useState<NmapScanResult | null>(null)
-  const [diagBusy, setDiagBusy] = useState(false)
-  const [diagErr, setDiagErr] = useState<string | null>(null)
   const [diag, setDiag] = useState<RuntimeDiagnostics | null>(null)
 
   const refreshIp = useCallback(async () => {
@@ -363,16 +361,12 @@ export function NetworkToolsPanel() {
   }, [nmapTarget, nmapProfile, nmapPorts, nmapTiming, nmapExtra])
 
   const refreshDiagnostics = useCallback(async () => {
-    setDiagBusy(true)
-    setDiagErr(null)
     try {
       const r = await invoke<RuntimeDiagnostics>('net_runtime_diagnostics')
       setDiag(r)
     } catch (e) {
-      setDiagErr(String(e))
+      console.warn('Dependency diagnostics failed:', e)
       setDiag(null)
-    } finally {
-      setDiagBusy(false)
     }
   }, [])
 
@@ -419,52 +413,6 @@ export function NetworkToolsPanel() {
       </p>
 
       <div className="network-tools-grid">
-        <article className="network-card net-tools-chrome network-card-wide">
-          <h3>Dependency health</h3>
-          <p className="muted network-card-desc">
-            OS-aware checks so users see tool names and install hints before scans fail.
-          </p>
-          <button type="button" disabled={diagBusy} onClick={() => void refreshDiagnostics()}>
-            {diagBusy ? 'Checking…' : 'Refresh checks'}
-          </button>
-          {diagErr ? <p className="error">{diagErr}</p> : null}
-          {diag ? (
-            <div className="network-diag-grid">
-              <p>
-                <strong>OS</strong> <span className="mono">{diag.os}</span>
-              </p>
-              <p>
-                <strong>Traceroute</strong>{' '}
-                <span className={diag.tracerouteAvailable ? 'network-ok-badge' : 'network-miss-badge'}>
-                  {diag.tracerouteAvailable ? `Ready (${diag.tracerouteTool ?? 'tool'})` : 'Missing'}
-                </span>
-              </p>
-              <p className="muted">{diag.tracerouteHint}</p>
-              <p>
-                <strong>Nmap</strong>{' '}
-                <span className={diag.nmapAvailable ? 'network-ok-badge' : 'network-miss-badge'}>
-                  {diag.nmapAvailable ? 'Ready' : 'Missing'}
-                </span>{' '}
-                {diag.nmapPath ? <span className="mono">{diag.nmapPath}</span> : null}
-              </p>
-              {!diag.nmapAvailable ? <p className="muted mono">{diag.nmapInstallHint}</p> : null}
-              <p>
-                <strong>Shell</strong>{' '}
-                <span className={diag.shellAvailable ? 'network-ok-badge' : 'network-miss-badge'}>
-                  {diag.shellAvailable ? `Ready (${diag.shellName ?? 'shell'})` : 'Missing'}
-                </span>
-              </p>
-              {diag.notes.length ? (
-                <ul className="network-warnings">
-                  {diag.notes.map((n) => (
-                    <li key={n}>{n}</li>
-                  ))}
-                </ul>
-              ) : null}
-            </div>
-          ) : null}
-        </article>
-
         <article className="network-card net-tools-chrome">
           <h3>IP & interfaces</h3>
           <p className="muted network-card-desc">Machine name, local addresses, and public IP (via ipwho.is).</p>

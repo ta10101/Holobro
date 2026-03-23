@@ -27,6 +27,8 @@ export type BrowserSettings = {
   privacyHardenContent: boolean
   /** Best-effort ad/tracker filtering for embedded pages. */
   blockAdsContent: boolean
+  /** NoScript-like mode: block page JavaScript execution. */
+  blockScriptsContent: boolean
   /** Non-persistent WebView2 profile for the embedded page. */
   contentIncognito: boolean
 }
@@ -123,6 +125,7 @@ export function loadBrowserSettings(): BrowserSettings {
         stealthUserAgent: true,
         privacyHardenContent: true,
         blockAdsContent: true,
+        blockScriptsContent: false,
         contentIncognito: true,
       }
     }
@@ -146,6 +149,7 @@ export function loadBrowserSettings(): BrowserSettings {
       stealthUserAgent: typeof p.stealthUserAgent === 'boolean' ? p.stealthUserAgent : true,
       privacyHardenContent: typeof p.privacyHardenContent === 'boolean' ? p.privacyHardenContent : true,
       blockAdsContent: typeof p.blockAdsContent === 'boolean' ? p.blockAdsContent : true,
+      blockScriptsContent: typeof p.blockScriptsContent === 'boolean' ? p.blockScriptsContent : false,
       contentIncognito: typeof p.contentIncognito === 'boolean' ? p.contentIncognito : true,
     }
   } catch {
@@ -160,6 +164,7 @@ export function loadBrowserSettings(): BrowserSettings {
       stealthUserAgent: true,
       privacyHardenContent: true,
       blockAdsContent: true,
+      blockScriptsContent: false,
       contentIncognito: true,
     }
   }
@@ -339,7 +344,8 @@ export function BrowserPanel({
     [findQuery, findCase],
   )
 
-  const openPage = async () => {
+  const openPage = async (settingsOverride?: BrowserSettings) => {
+    const s = settingsOverride ?? settings
     const u = normalizeUrl(url)
     setUrl(u)
     const b = readBounds()
@@ -353,20 +359,21 @@ export function BrowserPanel({
           url: u,
           bounds: b,
           privacy: {
-            stealthUserAgent: settings.stealthUserAgent,
-            blockWebrtc: settings.privacyHardenContent,
-            blockAds: settings.blockAdsContent,
-            useProxy: isContentProxyActive(settings),
-            proxyUrl: effectiveContentProxyUrl(settings),
-            incognito: settings.contentIncognito,
+            stealthUserAgent: s.stealthUserAgent,
+            blockWebrtc: s.privacyHardenContent,
+            blockAds: s.blockAdsContent,
+            blockScripts: s.blockScriptsContent,
+            useProxy: isContentProxyActive(s),
+            proxyUrl: effectiveContentProxyUrl(s),
+            incognito: s.contentIncognito,
           },
         },
       })
-      await invoke('content_webview_set_zoom', { scale: settings.zoom })
+      await invoke('content_webview_set_zoom', { scale: s.zoom })
       await syncBounds()
       setStatus(
-        isContentProxyActive(settings)
-          ? `Loaded via proxy (${settings.contentProxyPreset}): ${u}`
+        isContentProxyActive(s)
+          ? `Loaded via proxy (${s.contentProxyPreset}): ${u}`
           : `Loaded in app: ${u}`,
       )
     } catch (e) {
@@ -468,26 +475,52 @@ export function BrowserPanel({
   }, [])
 
   const toggleWebRtcHardening = useCallback(() => {
+    const u = normalizeUrl(url)
     const next = { ...settings, privacyHardenContent: !settings.privacyHardenContent }
     onSettingsChange(next)
     saveBrowserSettings(next)
     setStatus(
       next.privacyHardenContent
-        ? 'WebRTC hardening enabled. Press Go to rebuild embedded page with this setting.'
-        : 'WebRTC hardening disabled. Press Go to rebuild embedded page with this setting.',
+        ? 'WebRTC hardening enabled. Rebuilding embedded page...'
+        : 'WebRTC hardening disabled. Rebuilding embedded page...',
     )
-  }, [settings, onSettingsChange])
+    setUrl(u)
+    window.setTimeout(() => {
+      void openPage(next)
+    }, 0)
+  }, [settings, onSettingsChange, url, setUrl])
 
   const toggleAdBlocking = useCallback(() => {
+    const u = normalizeUrl(url)
     const next = { ...settings, blockAdsContent: !settings.blockAdsContent }
     onSettingsChange(next)
     saveBrowserSettings(next)
     setStatus(
       next.blockAdsContent
-        ? 'Ad block enabled. Press Go to rebuild embedded page with this setting.'
-        : 'Ad block disabled. Press Go to rebuild embedded page with this setting.',
+        ? 'Ad block enabled. Rebuilding embedded page...'
+        : 'Ad block disabled. Rebuilding embedded page...',
     )
-  }, [settings, onSettingsChange])
+    setUrl(u)
+    window.setTimeout(() => {
+      void openPage(next)
+    }, 0)
+  }, [settings, onSettingsChange, url, setUrl])
+
+  const toggleNoScript = useCallback(() => {
+    const u = normalizeUrl(url)
+    const next = { ...settings, blockScriptsContent: !settings.blockScriptsContent }
+    onSettingsChange(next)
+    saveBrowserSettings(next)
+    setStatus(
+      next.blockScriptsContent
+        ? 'NoScript enabled. Rebuilding embedded page...'
+        : 'NoScript disabled. Rebuilding embedded page...',
+    )
+    setUrl(u)
+    window.setTimeout(() => {
+      void openPage(next)
+    }, 0)
+  }, [settings, onSettingsChange, url, setUrl])
 
   const runNavCommand = useCallback(async (command: string, okLabel: string) => {
     try {
@@ -613,6 +646,9 @@ export function BrowserPanel({
           <button type="button" title="Toggle ad blocking for embedded page" onClick={toggleAdBlocking}>
             Ads {settings.blockAdsContent ? 'Off' : 'On'}
           </button>
+          <button type="button" title="Toggle NoScript mode for embedded page" onClick={toggleNoScript}>
+            NoScript {settings.blockScriptsContent ? 'Off' : 'On'}
+          </button>
           <button type="button" onClick={() => setSettingsOpen(true)}>
             Settings
           </button>
@@ -670,6 +706,11 @@ export function BrowserPanel({
         {settings.blockAdsContent ? (
           <span className="privacy-badge" title="Best-effort ad/tracker filtering is enabled">
             Ad block
+          </span>
+        ) : null}
+        {settings.blockScriptsContent ? (
+          <span className="privacy-badge" title="NoScript mode active (page JavaScript blocked)">
+            NoScript
           </span>
         ) : null}
       </div>
@@ -777,6 +818,14 @@ export function BrowserPanel({
                   onChange={(e) => onSettingsChange({ ...settings, blockAdsContent: e.target.checked })}
                 />
                 Block common ad/tracker hosts and ad elements (best-effort)
+              </label>
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={settings.blockScriptsContent}
+                  onChange={(e) => onSettingsChange({ ...settings, blockScriptsContent: e.target.checked })}
+                />
+                NoScript mode (disable page JavaScript; many modern sites will break)
               </label>
               <label className="check">
                 <input

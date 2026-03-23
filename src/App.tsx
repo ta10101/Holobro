@@ -1,4 +1,4 @@
-import { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from 'react'
+import { Component, Suspense, lazy, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from 'react'
 import {
   encodeHashToBase64,
   type ActionHash,
@@ -28,19 +28,36 @@ import {
   type ChatMessageRow,
   type ContactRow,
 } from './holochain'
-import { AssistantPanel } from './assistant/AssistantPanel'
-import { NetworkToolsPanel } from './network/NetworkToolsPanel'
-import { IrcDockPanel } from './irc/IrcDockPanel'
+import { DependencyCornerDock } from './network/DependencyCornerDock'
 import { TerminalMiniDock } from './terminal/TerminalMiniDock'
-import { WeatherPanel } from './weather/WeatherPanel'
 import { HoloBroLogo } from './components/HoloBroLogo'
+import { HoloBroMascot } from './components/HoloBroMascot'
+import { HoloBroWanderer } from './components/HoloBroWanderer'
 import { StreetTags } from './components/StreetTags'
 import { attachLocalVideo, createPeerConnection, wireRemoteStream } from './webrtc'
 import './App.css'
 
+const AssistantPanel = lazy(async () => {
+  const m = await import('./assistant/AssistantPanel')
+  return { default: m.AssistantPanel }
+})
+const NetworkToolsPanel = lazy(async () => {
+  const m = await import('./network/NetworkToolsPanel')
+  return { default: m.NetworkToolsPanel }
+})
+const WeatherPanel = lazy(async () => {
+  const m = await import('./weather/WeatherPanel')
+  return { default: m.WeatherPanel }
+})
+const IrcDockPanel = lazy(async () => {
+  const m = await import('./irc/IrcDockPanel')
+  return { default: m.IrcDockPanel }
+})
+
 type Tab = 'browser' | 'bookmarks' | 'contacts' | 'chat' | 'video' | 'assistant' | 'network' | 'weather'
 
 type ContactDisplay = { id: string; name: string; peerKey: string; proof: string }
+type AppIdentityResult = { username: string; device: string; displayName: string }
 
 const LS_BOOKMARKS = 'holobro-demo-bookmarks'
 const LS_BOOKMARKS_LEGACY = 'hab-demo-bookmarks'
@@ -48,6 +65,10 @@ const LS_CONTACTS = 'holobro-demo-contacts'
 const LS_CONTACTS_LEGACY = 'hab-demo-contacts'
 const LS_CHAT = 'holobro-demo-chat'
 const LS_CHAT_LEGACY = 'hab-demo-chat'
+const LS_STARTUP_GREETING = 'holobro-startup-greeting'
+const LS_COOKIE_JAR = 'holobro-cookie-jar-count'
+const LS_WANDERER_ENABLED = 'holobro-wanderer-enabled'
+const LS_WANDERER_SOUND_PACK = 'holobro-wanderer-sound-pack'
 
 function loadJson<T>(key: string, fallback: T): T {
   try {
@@ -78,10 +99,61 @@ function normalizeUrl(raw: string): string {
   return `https://${trimmed}`
 }
 
+function pickWelcomeLine(name: string): string {
+  const holobroLines = [
+    `Missed you, ${name}. HoloBro is happy you are back.`,
+    `Welcome back bro, ${name}. HoloBro was waiting.`,
+    `Long time no see, ${name}. holobro has your lane ready.`,
+    `${name}, HoloBro missed your style. Good to see you.`,
+  ]
+  const regularLines = [
+    `Welcome back bro, ${name}.`,
+    `Long time no see, ${name}. Good to have you here.`,
+    `${name}, good to see you again. Let's surf the grid.`,
+    `Hey ${name}, your board is waxed and ready.`,
+    `${name}, you are back. Feels right.`,
+    `Yo ${name}, the city lights stayed on for you.`,
+  ]
+  const includeHolobro = Math.random() < 0.4
+  const source = includeHolobro ? holobroLines : regularLines
+  return source[Math.floor(Math.random() * source.length)]
+}
+
+function playTranceBed() {
+  const Ctx = (window as typeof window & { webkitAudioContext?: typeof AudioContext }).AudioContext
+    || (window as typeof window & { webkitAudioContext?: typeof AudioContext }).webkitAudioContext
+  if (!Ctx) return
+  const ctx = new Ctx()
+  const now = ctx.currentTime
+  const master = ctx.createGain()
+  master.gain.value = 0.02
+  master.connect(ctx.destination)
+
+  const notes = [220, 246.94, 261.63, 329.63, 392, 329.63, 261.63, 246.94]
+  for (let i = 0; i < 20; i += 1) {
+    const osc = ctx.createOscillator()
+    const g = ctx.createGain()
+    osc.type = i % 2 === 0 ? 'triangle' : 'sawtooth'
+    osc.frequency.value = notes[i % notes.length]
+    g.gain.value = 0.0001
+    const t = now + i * 0.25
+    g.gain.linearRampToValueAtTime(0.05, t + 0.03)
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.23)
+    osc.connect(g)
+    g.connect(master)
+    osc.start(t)
+    osc.stop(t + 0.24)
+  }
+  window.setTimeout(() => {
+    void ctx.close().catch(() => {})
+  }, 5200)
+}
+
 function AppShell() {
   const [tab, setTab] = useState<Tab>('browser')
   const [hc, setHc] = useState<AppWebsocket | null>(null)
   const [hcStatus, setHcStatus] = useState<string>('Disconnected (demo storage)')
+  const [hcAttempted, setHcAttempted] = useState(false)
   const [url, setUrl] = useState('https://example.com')
   const [browserSettings, setBrowserSettings] = useState<BrowserSettings>(() =>
     loadBrowserSettings(),
@@ -110,33 +182,64 @@ function AppShell() {
   const localVid = useRef<HTMLVideoElement>(null)
   const remoteVid = useRef<HTMLVideoElement>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
+  const hcConnectingRef = useRef(false)
   const [videoPeerB64, setVideoPeerB64] = useState('')
   const [videoLog, setVideoLog] = useState<string[]>([])
+  const [appSettingsOpen, setAppSettingsOpen] = useState(false)
+  const [startupGreetingEnabled, setStartupGreetingEnabled] = useState(() => {
+    const raw = localStorage.getItem(LS_STARTUP_GREETING)
+    return raw == null ? true : raw === '1'
+  })
+  const [wandererEnabled, setWandererEnabled] = useState(() => {
+    const raw = localStorage.getItem(LS_WANDERER_ENABLED)
+    return raw == null ? true : raw === '1'
+  })
+  const [wandererSoundPack, setWandererSoundPack] = useState<'calm' | 'chaos' | 'street'>(() => {
+    const raw = localStorage.getItem(LS_WANDERER_SOUND_PACK)
+    return raw === 'calm' || raw === 'chaos' || raw === 'street' ? raw : 'street'
+  })
+  const [cookieJarCount, setCookieJarCount] = useState<number>(() => {
+    const raw = localStorage.getItem(LS_COOKIE_JAR)
+    const n = Number(raw ?? '0')
+    return Number.isFinite(n) && n > 0 ? Math.min(999, Math.floor(n)) : 0
+  })
+
+  const connectHolo = useCallback(async () => {
+    if (hc || hcConnectingRef.current || hcAttempted) return
+    hcConnectingRef.current = true
+    setHcAttempted(true)
+    const r = await tryConnectHolo()
+    if (r.ok) {
+      setHc(r.client)
+      setHcStatus(
+        r.signingNote
+          ? `Connected (with warning: ${r.signingNote})`
+          : 'Connected to Holochain',
+      )
+      try {
+        const b = await hcListBookmarks(r.client)
+        setBookmarks(b)
+        const c = await hcListContacts(r.client)
+        setContacts(c)
+      } catch (e) {
+        console.error(e)
+        setHcStatus((s) => `${s} — zome read failed (see console).`)
+      }
+    } else {
+      setHcStatus(`Demo mode: ${r.reason}`)
+    }
+    hcConnectingRef.current = false
+  }, [hc, hcAttempted])
 
   useEffect(() => {
-    void (async () => {
-      const r = await tryConnectHolo()
-      if (r.ok) {
-        setHc(r.client)
-        setHcStatus(
-          r.signingNote
-            ? `Connected (with warning: ${r.signingNote})`
-            : 'Connected to Holochain',
-        )
-        try {
-          const b = await hcListBookmarks(r.client)
-          setBookmarks(b)
-          const c = await hcListContacts(r.client)
-          setContacts(c)
-        } catch (e) {
-          console.error(e)
-          setHcStatus((s) => `${s} — zome read failed (see console).`)
-        }
-      } else {
-        setHcStatus(`Demo mode: ${r.reason}`)
-      }
-    })()
-  }, [])
+    const needsHolo = tab === 'bookmarks' || tab === 'contacts' || tab === 'chat' || tab === 'video'
+    if (needsHolo) void connectHolo()
+  }, [tab, connectHolo])
+
+  useEffect(() => {
+    const t = window.setTimeout(() => void connectHolo(), 2500)
+    return () => window.clearTimeout(t)
+  }, [connectHolo])
 
   useEffect(() => {
     saveJson(LS_BOOKMARKS, demoBookmarks)
@@ -147,6 +250,57 @@ function AppShell() {
   useEffect(() => {
     saveJson(LS_CHAT, demoChat)
   }, [demoChat])
+
+  useEffect(() => {
+    localStorage.setItem(LS_STARTUP_GREETING, startupGreetingEnabled ? '1' : '0')
+  }, [startupGreetingEnabled])
+  useEffect(() => {
+    localStorage.setItem(LS_WANDERER_ENABLED, wandererEnabled ? '1' : '0')
+  }, [wandererEnabled])
+  useEffect(() => {
+    localStorage.setItem(LS_WANDERER_SOUND_PACK, wandererSoundPack)
+  }, [wandererSoundPack])
+
+  useEffect(() => {
+    if (tab === 'browser' && !appSettingsOpen) {
+      void invoke('content_webview_show').catch(() => {})
+    } else {
+      void invoke('content_webview_hide').catch(() => {})
+    }
+  }, [tab, appSettingsOpen])
+  useEffect(() => {
+    if (!appSettingsOpen) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setAppSettingsOpen(false)
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [appSettingsOpen])
+  useEffect(() => {
+    localStorage.setItem(LS_COOKIE_JAR, String(cookieJarCount))
+  }, [cookieJarCount])
+
+  useEffect(() => {
+    if (!startupGreetingEnabled) return
+    let done = false
+    const run = async () => {
+      try {
+        const id = await invoke<AppIdentityResult>('app_identity')
+        if (done) return
+        const line = `${pickWelcomeLine(id.displayName)}`
+        playTranceBed()
+        console.info('[startup-greeting]', line)
+      } catch {
+        if (done) return
+        playTranceBed()
+        console.info('[startup-greeting]', 'Welcome back. HoloBro missed you.')
+      }
+    }
+    void run()
+    return () => {
+      done = true
+    }
+  }, [startupGreetingEnabled])
 
   const refreshThread = useCallback(async () => {
     if (!hc) return
@@ -192,6 +346,7 @@ function AppShell() {
     const u = normalizeUrl(url)
     const title = new URL(u).hostname
     const now = Date.now()
+    setCookieJarCount((c) => Math.min(999, c + 1))
     if (hc) {
       await hcCreateBookmark(hc, { url: u, title, created_at_ms: now })
       setBookmarks(await hcListBookmarks(hc))
@@ -336,32 +491,98 @@ function AppShell() {
           </div>
         </div>
         <StreetTags />
-        <span className="hc graffiti-status">{hcStatus}</span>
+        <div className="topbar-right">
+          <span className="hc graffiti-status">{hcStatus}</span>
+        </div>
       </header>
       <div className="shell">
         <nav className="nav">
-          {(
-            [
-              ['browser', 'Browser', '>>'],
-              ['bookmarks', 'Bookmarks', '##'],
-              ['contacts', 'Contacts', '@@'],
-              ['chat', 'Chat', '//'],
-              ['video', 'Video', '[]'],
-              ['weather', 'Weather', '**'],
-              ['assistant', 'Assistant', 'AI'],
-              ['network', 'Network', '::'],
-            ] as const
-          ).map(([id, label, icon]) => (
+          <div className="nav-links">
+            {(
+              [
+                ['browser', 'Browser', '>>'],
+                ['bookmarks', 'Bookmarks', '##'],
+                ['contacts', 'Contacts', '@@'],
+                ['chat', 'Chat', '//'],
+                ['video', 'Video', '[]'],
+                ['weather', 'Weather', '**'],
+                ['assistant', 'Assistant', 'AI'],
+                ['network', 'Network', '::'],
+              ] as const
+            ).map(([id, label, icon]) => (
+              <button
+                key={id}
+                type="button"
+                className={tab === id ? 'nav-btn active' : 'nav-btn'}
+                onClick={() => {
+                  if (id === 'browser') {
+                    if (!appSettingsOpen) void invoke('content_webview_show').catch(() => {})
+                  } else {
+                    void invoke('content_webview_hide').catch(() => {})
+                  }
+                  setTab(id)
+                  if (id === 'browser') setCookieJarCount((c) => Math.min(999, c + 1))
+                }}
+              >
+                <span className="nav-icon" aria-hidden="true">{icon}</span>
+                <span>{label}</span>
+              </button>
+            ))}
+          </div>
+          <div className="nav-bottom">
+            <section className="cookie-jar-card" aria-label="Cookie counter">
+              <div className="cookie-jar-head">
+                <span className="cookie-logo" aria-hidden="true">🍪</span>
+                <strong className="cookie-title">Cookie Jar</strong>
+              </div>
+              <p className="cookie-count">
+                {cookieJarCount} cookie{cookieJarCount === 1 ? '' : 's'}
+              </p>
+              <button
+                type="button"
+                className="small cookie-eat-btn"
+                onClick={() => setCookieJarCount(0)}
+                disabled={cookieJarCount <= 0}
+                title="Eat all cookies in the jar"
+              >
+                Eat cookies
+              </button>
+            </section>
+            <div className="nav-mascot-wrap" aria-label="HoloBro mascot">
+              <HoloBroMascot />
+            </div>
+            <section className="wander-nav-card" aria-label="HoloBro wanderer settings">
+              <label className="check wander-check">
+                <input
+                  type="checkbox"
+                  checked={wandererEnabled}
+                  onChange={(e) => setWandererEnabled(e.target.checked)}
+                />
+                HoloBro wander
+              </label>
+              <label className="wander-pack-row">
+                <span className="deps-label">Sound</span>
+                <select
+                  value={wandererSoundPack}
+                  onChange={(e) => setWandererSoundPack(e.target.value as 'calm' | 'chaos' | 'street')}
+                >
+                  <option value="calm">Calm</option>
+                  <option value="street">Street</option>
+                  <option value="chaos">Chaos</option>
+                </select>
+              </label>
+            </section>
             <button
-              key={id}
               type="button"
-              className={tab === id ? 'nav-btn active' : 'nav-btn'}
-              onClick={() => setTab(id)}
+              className={appSettingsOpen ? 'nav-btn active app-settings-toggle' : 'nav-btn app-settings-toggle'}
+              onClick={() => setAppSettingsOpen((v) => !v)}
+              aria-pressed={appSettingsOpen}
             >
-              <span className="nav-icon" aria-hidden="true">{icon}</span>
-              <span>{label}</span>
+              <span className="nav-icon" aria-hidden="true">⚙</span>
+              <span>App Settings</span>
             </button>
-          ))}
+            <DependencyCornerDock />
+          </div>
         </nav>
         <main className="main">
           {tab === 'browser' && (
@@ -470,7 +691,9 @@ function AppShell() {
               <p className="hint">
                 Encrypt message bodies client-side before production; the DNA stores opaque text for now.
               </p>
-              <IrcDockPanel />
+              <Suspense fallback={<p className="muted">Loading IRC…</p>}>
+                <IrcDockPanel />
+              </Suspense>
             </section>
           )}
           {tab === 'video' && (
@@ -507,12 +730,51 @@ function AppShell() {
               </ul>
             </section>
           )}
-          {tab === 'weather' && <WeatherPanel />}
-          {tab === 'assistant' && <AssistantPanel />}
-          {tab === 'network' && <NetworkToolsPanel />}
+          {tab === 'weather' && (
+            <Suspense fallback={<section className="panel"><p className="muted">Loading Weather…</p></section>}>
+              <WeatherPanel />
+            </Suspense>
+          )}
+          {tab === 'assistant' && (
+            <Suspense fallback={<section className="panel"><p className="muted">Loading Assistant…</p></section>}>
+              <AssistantPanel />
+            </Suspense>
+          )}
+          {tab === 'network' && (
+            <Suspense fallback={<section className="panel"><p className="muted">Loading Network tools…</p></section>}>
+              <NetworkToolsPanel />
+            </Suspense>
+          )}
         </main>
       </div>
       <TerminalMiniDock />
+      <HoloBroWanderer enabled={wandererEnabled} soundPack={wandererSoundPack} alwaysShow />
+      {appSettingsOpen && (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label="App settings"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setAppSettingsOpen(false)
+          }}
+        >
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h3>App settings</h3>
+            <label className="check">
+              <input
+                type="checkbox"
+                checked={startupGreetingEnabled}
+                onChange={(e) => setStartupGreetingEnabled(e.target.checked)}
+              />
+              Startup greeting music (low 5s trance bed)
+            </label>
+            <div className="modal-actions">
+              <button type="button" onClick={() => setAppSettingsOpen(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

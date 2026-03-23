@@ -3,6 +3,7 @@ mod irc_tools;
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use std::env;
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use tauri::webview::WebviewBuilder;
@@ -31,6 +32,9 @@ pub struct ContentPrivacySettings {
     /// Best-effort ad/tracker request + element blocking in embedded pages.
     #[serde(default = "default_true")]
     pub block_ads: bool,
+    /// NoScript-like mode: disable or suppress page JavaScript.
+    #[serde(default)]
+    pub block_scripts: bool,
     /// Route the embedded webview through HTTP or SOCKS5 proxy (e.g. Tor `socks5://127.0.0.1:9050`).
     #[serde(default)]
     pub use_proxy: bool,
@@ -54,19 +58,25 @@ fn default_content_privacy() -> ContentPrivacySettings {
         stealth_user_agent: true,
         block_webrtc: true,
         block_ads: true,
+        block_scripts: false,
         use_proxy: false,
         proxy_url: default_tor_socks(),
         incognito: true,
     }
 }
 
-fn privacy_init_script(block_webrtc: bool, block_ads: bool) -> String {
+fn privacy_init_script(block_webrtc: bool, block_ads: bool, block_scripts: bool) -> String {
     let mut s = String::from("(function(){try{");
     if block_webrtc {
-        s.push_str(r#"var REJ=function(){return Promise.reject(new DOMException("Not allowed","NotAllowedError"))};if(navigator.mediaDevices){navigator.mediaDevices.getUserMedia=REJ;navigator.mediaDevices.getDisplayMedia=REJ;navigator.mediaDevices.enumerateDevices=function(){return Promise.resolve([])}}function Block(){throw new DOMException("WebRTC disabled","NotSupportedError")}Block.prototype={};["RTCPeerConnection","webkitRTCPeerConnection","mozRTCPeerConnection"].forEach(function(k){if(window[k])window[k]=Block});"#);
+        s.push_str(r#"var REJ=function(){return Promise.reject(new DOMException("Not allowed","NotAllowedError"))};if(navigator.mediaDevices){try{navigator.mediaDevices.getUserMedia=REJ;}catch(_){ }try{navigator.mediaDevices.getDisplayMedia=REJ;}catch(_){ }try{navigator.mediaDevices.enumerateDevices=function(){return Promise.resolve([])};}catch(_){ }}try{navigator.getUserMedia=undefined;navigator.webkitGetUserMedia=undefined;navigator.mozGetUserMedia=undefined;navigator.msGetUserMedia=undefined;}catch(_){ }function hideApi(name){try{Object.defineProperty(window,name,{value:undefined,writable:false,configurable:false});}catch(_){try{window[name]=undefined;}catch(__){}}try{delete window[name];}catch(_){}}["RTCPeerConnection","webkitRTCPeerConnection","mozRTCPeerConnection","RTCIceCandidate","RTCSessionDescription","MediaStreamTrackEvent","RTCDataChannelEvent"].forEach(hideApi);"#);
     }
     if block_ads {
-        s.push_str(r#"var AD_HOSTS=["doubleclick.net","googlesyndication.com","googleadservices.com","adservice.google.com","adservice.google.dk","googletagmanager.com","google-analytics.com","facebook.net","ads-twitter.com","taboola.com","outbrain.com","adnxs.com","scorecardresearch.com"];var hbBlockedHost=function(u){try{var h=(new URL(u,location.href)).hostname.toLowerCase();for(var i=0;i<AD_HOSTS.length;i++){var d=AD_HOSTS[i];if(h===d||h.endsWith("."+d))return true}return false}catch(_){return false}};var hbFetch=window.fetch;if(hbFetch){window.fetch=function(input,init){var u=typeof input==="string"?input:(input&&input.url?input.url:"");if(u&&hbBlockedHost(u)){return Promise.resolve(new Response("",{status:204,statusText:"Blocked"}))}return hbFetch.apply(this,arguments)}};var hbOpen=XMLHttpRequest.prototype.open;var hbSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(method,url){this.__hbUrl=url;return hbOpen.apply(this,arguments)};XMLHttpRequest.prototype.send=function(body){if(this.__hbUrl&&hbBlockedHost(this.__hbUrl)){try{this.abort()}catch(_){}return}return hbSend.apply(this,arguments)};var css=document.createElement("style");css.textContent="[id*='ad-'],[class*='ad-'],[class*='ads-'],[class*='advert'],[id*='sponsor'],[class*='sponsor'],iframe[src*='doubleclick'],iframe[src*='googlesyndication'],iframe[src*='adservice'],.adsbygoogle{display:none!important;visibility:hidden!important;max-height:0!important;min-height:0!important;}";document.documentElement.appendChild(css);"#);
+        // Keep ad blocking best-effort and non-breaking: hide common ad elements without intercepting fetch/XHR.
+        s.push_str(r#"var css=document.createElement("style");css.textContent="[id*='ad-'],[class*='ad-'],[class*='ads-'],[class*='advert'],[id*='sponsor'],[class*='sponsor'],iframe[src*='doubleclick'],iframe[src*='googlesyndication'],iframe[src*='adservice'],iframe[src*='taboola'],iframe[src*='outbrain'],.adsbygoogle,#player-ads,.video-ads,.ytp-ad-module,.ytp-ad-overlay-container,.ytp-ad-player-overlay,ytd-display-ad-renderer,ytd-promoted-sparkles-web-renderer,ytd-promoted-video-renderer,ytd-in-feed-ad-layout-renderer,ytd-ad-slot-renderer{display:none!important;visibility:hidden!important;max-height:0!important;min-height:0!important;}";document.documentElement.appendChild(css);var hbKill=function(){try{document.querySelectorAll(\"iframe[src*='doubleclick'],iframe[src*='googlesyndication'],iframe[src*='adservice'],iframe[src*='taboola'],iframe[src*='outbrain'],#player-ads,.video-ads,.ytp-ad-module,.ytp-ad-overlay-container,.ytp-ad-player-overlay,ytd-display-ad-renderer,ytd-promoted-sparkles-web-renderer,ytd-promoted-video-renderer,ytd-in-feed-ad-layout-renderer,ytd-ad-slot-renderer\").forEach(function(n){n.remove();});var skip=document.querySelector('.ytp-ad-skip-button,.ytp-ad-skip-button-modern,.ytp-skip-ad-button,.videoAdUiSkipButton');if(skip&&typeof skip.click==='function'){skip.click();}var adShowing=document.querySelector('.ad-showing,.html5-video-player.ad-showing');var v=document.querySelector('video');if(adShowing&&v){try{v.muted=true;}catch(_){ }if(isFinite(v.duration)&&v.duration>0){try{v.currentTime=Math.max(0,v.duration-0.05);}catch(_){ }} } }catch(_){}};hbKill();var obs=new MutationObserver(function(){hbKill();});obs.observe(document.documentElement||document.body,{subtree:true,childList:true,attributes:true});var hbTimer=setInterval(hbKill,350);setTimeout(function(){try{clearInterval(hbTimer);}catch(_){ }},30000);"#);
+    }
+    if block_scripts {
+        // Best-effort NoScript fallback for engines where hard JS disable is unavailable.
+        s.push_str(r#"try{var meta=document.createElement('meta');meta.httpEquiv='Content-Security-Policy';meta.content="script-src 'none'; object-src 'none'; worker-src 'none'";(document.head||document.documentElement).appendChild(meta);}catch(_){ }try{window.eval=undefined;window.Function=undefined;}catch(_){ }var hbNoScript=function(){try{document.querySelectorAll('script').forEach(function(n){n.type='javascript/blocked';n.remove();});}catch(_){ }};hbNoScript();var obsNoScript=new MutationObserver(function(ms){try{for(var i=0;i<ms.length;i++){var m=ms[i];if(!m.addedNodes)continue;for(var j=0;j<m.addedNodes.length;j++){var n=m.addedNodes[j];if(n&&n.tagName==='SCRIPT'){try{n.type='javascript/blocked';n.remove();}catch(_){ }}}}}catch(_){ }hbNoScript();});obsNoScript.observe(document.documentElement||document.body,{subtree:true,childList:true});"#);
     }
     s.push_str("}catch(e){}})();");
     s
@@ -165,6 +175,14 @@ pub struct LlmListModelsResult {
     pub models: Vec<LlmModelInfo>,
 }
 
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppIdentityResult {
+    pub username: String,
+    pub device: String,
+    pub display_name: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LlmPullRequest {
@@ -233,11 +251,31 @@ async fn content_webview_ensure(app: tauri::AppHandle, req: ContentWebviewEnsure
         builder = builder.user_agent(GENERIC_CHROME_UA);
     }
 
-    if privacy.block_webrtc || privacy.block_ads {
+    if privacy.block_webrtc || privacy.block_ads || privacy.block_scripts {
         builder = builder.initialization_script_for_all_frames(&privacy_init_script(
             privacy.block_webrtc,
             privacy.block_ads,
+            privacy.block_scripts,
         ));
+    }
+
+    #[cfg(windows)]
+    {
+        let mut args = Vec::<&str>::new();
+        if privacy.block_webrtc {
+            // Engine-level disable hints for WebView2 to reduce checker-detected WebRTC surface.
+            args.push("--disable-webrtc");
+            args.push("--webrtc-ip-handling-policy=disable_non_proxied_udp");
+            args.push("--force-webrtc-ip-handling-policy=disable_non_proxied_udp");
+            args.push("--enforce-webrtc-ip-permission-check");
+        }
+        if privacy.block_scripts {
+            // Chromium/WebView2-wide JavaScript off switch.
+            args.push("--disable-javascript");
+        }
+        if !args.is_empty() {
+            builder = builder.additional_browser_args(&args.join(" "));
+        }
     }
 
     if privacy.use_proxy {
@@ -339,6 +377,35 @@ async fn content_webview_set_zoom(app: tauri::AppHandle, scale: f64) -> Result<(
             w.eval(js).map_err(|e| e.to_string())
         }
     }
+}
+
+#[tauri::command]
+async fn app_identity() -> Result<AppIdentityResult, String> {
+    let username = env::var("USERNAME")
+        .ok()
+        .or_else(|| env::var("USER").ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "friend".to_string());
+
+    let device = hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "your rig".to_string());
+
+    let lowered = username.to_lowercase();
+    let display_name = if lowered == "user" || lowered == "admin" || lowered == "administrator" {
+        device.clone()
+    } else {
+        username.clone()
+    };
+
+    Ok(AppIdentityResult {
+        username,
+        device,
+        display_name,
+    })
 }
 
 #[tauri::command]
@@ -895,6 +962,7 @@ pub fn run() {
             content_webview_hide,
             content_webview_show,
             content_webview_focus,
+            app_identity,
             fetch_url_bridge,
             shell_exec,
             llm_health,
