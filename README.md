@@ -128,7 +128,7 @@ WebView2 is a **shared Microsoft runtime** used by many apps; uninstalling HoloB
 **Windows installers (maintainers):**
 
 - **NSIS** — usually **downloaded automatically** by the Tauri CLI on first bundle.  
-- **MSI (WiX)** — install [WiX Toolset v3.11+](https://wixtoolset.org/docs/wix3/) (e.g. `winget install WiXToolset.WiXToolset`) so `candle` / `light` are available, or the MSI step may fail.
+- **MSI (WiX)** — the Tauri CLI often **downloads WiX** automatically (like NSIS). If the MSI step fails, install [WiX Toolset v3.11+](https://wixtoolset.org/docs/wix3/) (e.g. `winget install WiXToolset.WiXToolset`) so `candle` / `light` are on `PATH`.
 
 ### Dev (hot reload)
 
