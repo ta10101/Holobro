@@ -1,0 +1,15 @@
+---
+manifest_version: "0"
+name: holobro
+description: HoloBro — Holochain-backed browser shell (bookmarks, contacts, chat, signaling)
+roles:
+  - name: anon_browser
+    provisioning:
+      strategy: create
+      deferred: false
+    dna:
+      path: "../dnas/anon_browser/workdir/anon_browser.dna"
+      modifiers:
+        network_seed: ~
+        properties: ~
+        clone_limit: 0

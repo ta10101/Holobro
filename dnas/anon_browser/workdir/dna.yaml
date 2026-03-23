@@ -1,0 +1,18 @@
+---
+manifest_version: "0"
+name: anon_browser
+integrity:
+  network_seed: ~
+  properties: ~
+  zomes:
+    - name: anon_browser_integrity
+      hash: ~
+      path: "../../../target/wasm32-unknown-unknown/release/anon_browser_integrity.wasm"
+      dependencies: ~
+coordinator:
+  zomes:
+    - name: anon_browser
+      hash: ~
+      path: "../../../target/wasm32-unknown-unknown/release/anon_browser.wasm"
+      dependencies:
+        - name: anon_browser_integrity

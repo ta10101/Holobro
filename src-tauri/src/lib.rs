@@ -1,0 +1,797 @@
+mod network_tools;
+
+use futures_util::StreamExt;
+use serde::{Deserialize, Serialize};
+use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
+use tauri::webview::WebviewBuilder;
+use tauri::LogicalPosition;
+use tauri::LogicalSize;
+use tauri::Manager;
+use tauri::Url;
+use tauri::WebviewUrl;
+
+const MAX_FETCH_BYTES: usize = 2 * 1024 * 1024;
+const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 45;
+const CONTENT_WEBVIEW_LABEL: &str = "content";
+
+/// Injected at document start on all frames: block getUserMedia / enumerateDevices stubs and neuter RTCPeerConnection (best-effort anti-IP-leak).
+const PRIVACY_INIT_SCRIPT: &str = r#"(function(){try{var REJ=function(){return Promise.reject(new DOMException("Not allowed","NotAllowedError"))};if(navigator.mediaDevices){navigator.mediaDevices.getUserMedia=REJ;navigator.mediaDevices.getDisplayMedia=REJ;navigator.mediaDevices.enumerateDevices=function(){return Promise.resolve([])}}function Block(){throw new DOMException("WebRTC disabled","NotSupportedError")}Block.prototype={};["RTCPeerConnection","webkitRTCPeerConnection","mozRTCPeerConnection"].forEach(function(k){if(window[k])window[k]=Block})}catch(e){}})();"#;
+
+/// Generic desktop Chrome UA (no custom product token) — only used when user turns off stealth / engine-default UA.
+const GENERIC_CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentPrivacySettings {
+    /// When true, do not set a custom User-Agent (WebView2 uses its normal Edge-class string — less unique).
+    #[serde(default = "default_true")]
+    pub stealth_user_agent: bool,
+    /// Inject WebRTC / media hardening script on all frames.
+    #[serde(default = "default_true")]
+    pub block_webrtc: bool,
+    /// Route the embedded webview through HTTP or SOCKS5 proxy (e.g. Tor `socks5://127.0.0.1:9050`).
+    #[serde(default)]
+    pub use_proxy: bool,
+    #[serde(default = "default_tor_socks")]
+    pub proxy_url: String,
+    /// Ephemeral WebView2 profile (no persisted session between recreates).
+    #[serde(default = "default_true")]
+    pub incognito: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_tor_socks() -> String {
+    "socks5://127.0.0.1:9050".into()
+}
+
+fn default_content_privacy() -> ContentPrivacySettings {
+    ContentPrivacySettings {
+        stealth_user_agent: true,
+        block_webrtc: true,
+        use_proxy: false,
+        proxy_url: default_tor_socks(),
+        incognito: true,
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentWebviewEnsureRequest {
+    pub url: String,
+    pub bounds: ContentBounds,
+    #[serde(default = "default_content_privacy")]
+    pub privacy: ContentPrivacySettings,
+}
+
+fn privacy_fingerprint(p: &ContentPrivacySettings) -> String {
+    serde_json::to_string(p).unwrap_or_default()
+}
+
+static LAST_CONTENT_PRIVACY_FP: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+fn last_content_privacy_fp() -> &'static Mutex<Option<String>> {
+    LAST_CONTENT_PRIVACY_FP.get_or_init(|| Mutex::new(None))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmChatRequest {
+    pub base_url: String,
+    pub model: String,
+    pub message: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// `"ollama"` (default) or `"openai"` for `/v1/chat/completions`.
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaChatResponse {
+    message: OllamaMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct OllamaMessage {
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChatResponse {
+    choices: Vec<OpenAiChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiChoice {
+    message: OpenAiMsg,
+}
+
+#[derive(Debug, Deserialize)]
+struct OpenAiMsg {
+    content: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmConnectionRequest {
+    pub base_url: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub provider: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmHealthResult {
+    pub ok: bool,
+    pub backend: String,
+    pub version: Option<String>,
+    pub message: String,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmModelInfo {
+    pub name: String,
+    pub size_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmListModelsResult {
+    pub models: Vec<LlmModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LlmPullRequest {
+    pub base_url: String,
+    pub model: String,
+    #[serde(default)]
+    pub api_key: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+fn content_webview<R: tauri::Runtime>(app: &tauri::AppHandle<R>) -> Option<tauri::webview::Webview<R>> {
+    app.get_webview(CONTENT_WEBVIEW_LABEL)
+}
+
+/// Embeds a second WebView2 in the main window (same window as the shell UI).
+#[tauri::command]
+async fn content_webview_ensure(app: tauri::AppHandle, req: ContentWebviewEnsureRequest) -> Result<(), String> {
+    let url = req.url;
+    let bounds = req.bounds;
+    let privacy = req.privacy;
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("Only http(s) URLs are allowed.".into());
+    }
+    let parsed = Url::parse(&url).map_err(|e| e.to_string())?;
+    let window = app
+        .get_window("main")
+        .ok_or_else(|| "Main window not found (expected label \"main\").".to_string())?;
+
+    let fp = privacy_fingerprint(&privacy);
+    if let Some(w) = content_webview(&app) {
+        let guard = last_content_privacy_fp()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let same = guard.as_ref() == Some(&fp);
+        if same {
+            w.navigate(parsed).map_err(|e| e.to_string())?;
+            w.set_position(LogicalPosition::new(bounds.x, bounds.y))
+                .map_err(|e| e.to_string())?;
+            w.set_size(LogicalSize::new(bounds.width, bounds.height))
+                .map_err(|e| e.to_string())?;
+            w.show().map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        let _ = w.close();
+        if let Ok(mut g) = last_content_privacy_fp().lock() {
+            *g = None;
+        }
+    }
+
+    let webview_url = WebviewUrl::External(parsed);
+    let mut builder = WebviewBuilder::new(CONTENT_WEBVIEW_LABEL, webview_url);
+
+    if privacy.stealth_user_agent {
+        // Omit custom UA — WebView2 reports a normal Edge-class string (far less fingerprint noise).
+    } else {
+        builder = builder.user_agent(GENERIC_CHROME_UA);
+    }
+
+    if privacy.block_webrtc {
+        builder = builder.initialization_script_for_all_frames(PRIVACY_INIT_SCRIPT);
+    }
+
+    if privacy.use_proxy {
+        let pu = privacy.proxy_url.trim();
+        if !pu.is_empty() {
+            let proxy = Url::parse(pu).map_err(|e| format!("Invalid content proxy URL: {e}"))?;
+            let scheme = proxy.scheme();
+            if scheme != "http" && scheme != "socks5" {
+                return Err("Content proxy must be http:// or socks5:// (Tauri requirement).".into());
+            }
+            builder = builder.proxy_url(proxy);
+        }
+    }
+
+    if privacy.incognito {
+        builder = builder.incognito(true);
+    }
+
+    window
+        .add_child(
+            builder,
+            LogicalPosition::new(bounds.x, bounds.y),
+            LogicalSize::new(bounds.width, bounds.height),
+        )
+        .map_err(|e| e.to_string())?;
+
+    if let Ok(mut g) = last_content_privacy_fp().lock() {
+        *g = Some(fp);
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn content_webview_set_bounds(app: tauri::AppHandle, bounds: ContentBounds) -> Result<(), String> {
+    let w = content_webview(&app).ok_or_else(|| "No embedded page yet.".to_string())?;
+    w.set_position(LogicalPosition::new(bounds.x, bounds.y))
+        .map_err(|e| e.to_string())?;
+    w.set_size(LogicalSize::new(bounds.width, bounds.height))
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn content_webview_navigate(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err("Only http(s) URLs are allowed.".into());
+    }
+    let parsed = Url::parse(&url).map_err(|e| e.to_string())?;
+    let w = content_webview(&app).ok_or_else(|| "No embedded page yet.".to_string())?;
+    w.navigate(parsed).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn content_webview_back(app: tauri::AppHandle) -> Result<(), String> {
+    let w = content_webview(&app).ok_or_else(|| "No embedded page yet.".to_string())?;
+    w.eval("window.history.back()").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn content_webview_forward(app: tauri::AppHandle) -> Result<(), String> {
+    let w = content_webview(&app).ok_or_else(|| "No embedded page yet.".to_string())?;
+    w.eval("window.history.forward()").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn content_webview_reload(app: tauri::AppHandle) -> Result<(), String> {
+    let w = content_webview(&app).ok_or_else(|| "No embedded page yet.".to_string())?;
+    w.reload().map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn content_webview_hard_reload(app: tauri::AppHandle) -> Result<(), String> {
+    let w = content_webview(&app).ok_or_else(|| "No embedded page yet.".to_string())?;
+    w.eval("location.reload(true);")
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn content_webview_stop(app: tauri::AppHandle) -> Result<(), String> {
+    let w = content_webview(&app).ok_or_else(|| "No embedded page yet.".to_string())?;
+    w.eval("window.stop();").map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn content_webview_set_zoom(app: tauri::AppHandle, scale: f64) -> Result<(), String> {
+    let w = content_webview(&app).ok_or_else(|| "No embedded page yet.".to_string())?;
+    let s = scale.clamp(0.25, 4.0);
+    w.set_zoom(s).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn content_webview_print(app: tauri::AppHandle) -> Result<(), String> {
+    let w = content_webview(&app).ok_or_else(|| "No embedded page yet.".to_string())?;
+    w.print().map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FindInPageArgs {
+    query: String,
+    #[serde(default)]
+    case_sensitive: Option<bool>,
+    #[serde(default)]
+    backwards: Option<bool>,
+}
+
+/// In-page search using `window.find` (Chromium/WebView2).
+#[tauri::command]
+async fn content_webview_find(app: tauri::AppHandle, args: FindInPageArgs) -> Result<(), String> {
+    let w = content_webview(&app).ok_or_else(|| "No embedded page yet.".to_string())?;
+    let case_sensitive = args.case_sensitive.unwrap_or(false);
+    let backwards = args.backwards.unwrap_or(false);
+    let q = serde_json::to_string(&args.query).map_err(|e| e.to_string())?;
+    let js = format!(
+        "window.find({}, {}, {}, true);",
+        q,
+        if case_sensitive { "true" } else { "false" },
+        if backwards { "true" } else { "false" },
+    );
+    w.eval(js).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn content_webview_hide(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(w) = content_webview(&app) {
+        w.hide().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+async fn content_webview_show(app: tauri::AppHandle) -> Result<(), String> {
+    if let Some(w) = content_webview(&app) {
+        w.show().map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchBridgeResult {
+    pub body: String,
+    pub status: u16,
+    pub content_type: String,
+    pub final_url: String,
+    pub byte_length: usize,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchBridgeRequest {
+    pub url: String,
+    pub proxy: Option<String>,
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+/// Clearnet HTTP bridge: fetch a URL from the Tauri host. Optional `proxy` uses SOCKS5 for Tor, etc.
+#[tauri::command]
+async fn fetch_url_bridge(req: FetchBridgeRequest) -> Result<FetchBridgeResult, String> {
+    if !req.url.starts_with("http://") && !req.url.starts_with("https://") {
+        return Err("Only http(s) URLs are allowed.".into());
+    }
+    let url = req.url;
+    let timeout = req
+        .timeout_secs
+        .unwrap_or(DEFAULT_FETCH_TIMEOUT_SECS)
+        .max(1)
+        .min(600);
+    let max_bytes = req
+        .max_bytes
+        .unwrap_or(MAX_FETCH_BYTES)
+        .min(MAX_FETCH_BYTES)
+        .max(1024);
+
+    let mut builder = reqwest::Client::builder()
+        .user_agent("HoloBro/0.1")
+        .timeout(Duration::from_secs(timeout))
+        .redirect(reqwest::redirect::Policy::limited(10));
+    if let Some(p) = req.proxy {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            let proxy = reqwest::Proxy::all(trimmed).map_err(|e| format!("Invalid proxy: {e}"))?;
+            builder = builder.proxy(proxy);
+        }
+    }
+    let client = builder.build().map_err(|e| e.to_string())?;
+    let res = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    let status = res.status().as_u16();
+    let final_url = res.url().to_string();
+    let content_type = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let bytes = res.bytes().await.map_err(|e| e.to_string())?;
+    if bytes.len() > max_bytes {
+        return Err(format!(
+            "Response too large ({} bytes); max {} bytes (adjust in Settings).",
+            bytes.len(),
+            max_bytes
+        ));
+    }
+    let body = String::from_utf8_lossy(bytes.as_ref()).into_owned();
+    let byte_length = body.len();
+    Ok(FetchBridgeResult {
+        body,
+        status,
+        content_type,
+        final_url,
+        byte_length,
+    })
+}
+
+fn llm_timeout(req_secs: Option<u64>) -> Duration {
+    Duration::from_secs(req_secs.unwrap_or(120).clamp(5, 600))
+}
+
+fn auth_header(req: &LlmChatRequest) -> Option<String> {
+    req.api_key
+        .as_ref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|k| format!("Bearer {k}"))
+}
+
+/// Probe Ollama (`/api/version`) or OpenAI-compatible (`/v1/models`).
+#[tauri::command]
+async fn llm_health(req: LlmConnectionRequest) -> Result<LlmHealthResult, String> {
+    let base = req.base_url.trim_end_matches('/');
+    if base.is_empty() {
+        return Err("Base URL is empty.".into());
+    }
+    let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(12).clamp(1, 120));
+    let provider = req.provider.as_deref().unwrap_or("ollama");
+
+    let client = reqwest::Client::builder()
+        .user_agent("HoloBro-LLM/0.1")
+        .timeout(timeout)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    if provider == "openai" {
+        let url = format!("{base}/v1/models");
+        let mut r = client.get(&url);
+        if let Some(ref k) = req.api_key {
+            let t = k.trim();
+            if !t.is_empty() {
+                r = r.header("Authorization", format!("Bearer {t}"));
+            }
+        }
+        let res = r.send().await.map_err(|e| e.to_string())?;
+        if res.status().is_success() {
+            return Ok(LlmHealthResult {
+                ok: true,
+                backend: "openai".into(),
+                version: None,
+                message: format!("{} reachable (HTTP {})", base, res.status()),
+            });
+        }
+        return Ok(LlmHealthResult {
+            ok: false,
+            backend: "openai".into(),
+            version: None,
+            message: format!(
+                "HTTP {} — check URL, API key, and that the server exposes /v1/models",
+                res.status()
+            ),
+        });
+    }
+
+    let url = format!("{base}/api/version");
+    let res = client.get(&url).send().await;
+    match res {
+        Ok(r) if r.status().is_success() => {
+            let v: serde_json::Value = r.json().await.unwrap_or(serde_json::json!({}));
+            let version = v
+                .get("version")
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string());
+            Ok(LlmHealthResult {
+                ok: true,
+                backend: "ollama".into(),
+                version,
+                message: "Ollama responded at /api/version.".into(),
+            })
+        }
+        Ok(r) => Ok(LlmHealthResult {
+            ok: false,
+            backend: "ollama".into(),
+            version: None,
+            message: format!(
+                "HTTP {} — start Ollama or set Base URL (e.g. http://127.0.0.1:11434)",
+                r.status()
+            ),
+        }),
+        Err(e) => Ok(LlmHealthResult {
+            ok: false,
+            backend: "ollama".into(),
+            version: None,
+            message: format!("Cannot connect: {e}"),
+        }),
+    }
+}
+
+/// List models: Ollama `/api/tags` or OpenAI-compatible `/v1/models`.
+#[tauri::command]
+async fn llm_list_models(req: LlmConnectionRequest) -> Result<LlmListModelsResult, String> {
+    let base = req.base_url.trim_end_matches('/');
+    let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(30).clamp(5, 120));
+    let provider = req.provider.as_deref().unwrap_or("ollama");
+
+    let client = reqwest::Client::builder()
+        .user_agent("HoloBro-LLM/0.1")
+        .timeout(timeout)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    if provider == "openai" {
+        let url = format!("{base}/v1/models");
+        let mut r = client.get(&url);
+        if let Some(ref k) = req.api_key {
+            let t = k.trim();
+            if !t.is_empty() {
+                r = r.header("Authorization", format!("Bearer {t}"));
+            }
+        }
+        let res = r.send().await.map_err(|e| e.to_string())?;
+        if !res.status().is_success() {
+            return Err(format!("List models HTTP {}: {}", res.status(), res.text().await.unwrap_or_default()));
+        }
+        let v: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+        let data = v
+            .get("data")
+            .and_then(|d| d.as_array())
+            .ok_or_else(|| "Unexpected /v1/models JSON (missing data[]).".to_string())?;
+        let mut models = Vec::new();
+        for item in data {
+            if let Some(id) = item.get("id").and_then(|x| x.as_str()) {
+                models.push(LlmModelInfo {
+                    name: id.to_string(),
+                    size_bytes: None,
+                });
+            }
+        }
+        models.sort_by(|a, b| a.name.cmp(&b.name));
+        return Ok(LlmListModelsResult { models });
+    }
+
+    let url = format!("{base}/api/tags");
+    let res = client.get(&url).send().await.map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        return Err(format!(
+            "Ollama tags HTTP {}: {}",
+            res.status(),
+            res.text().await.unwrap_or_default()
+        ));
+    }
+    let v: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
+    let arr = v
+        .get("models")
+        .and_then(|m| m.as_array())
+        .ok_or_else(|| "Unexpected Ollama /api/tags JSON.".to_string())?;
+    let mut models = Vec::new();
+    for item in arr {
+        let name = item
+            .get("name")
+            .and_then(|x| x.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let size_bytes = item.get("size").and_then(|x| x.as_u64());
+        models.push(LlmModelInfo { name, size_bytes });
+    }
+    models.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(LlmListModelsResult { models })
+}
+
+/// Ollama `POST /api/pull` — downloads a model (can take a long time; uses streaming response).
+#[tauri::command]
+async fn llm_pull_ollama(req: LlmPullRequest) -> Result<String, String> {
+    let base = req.base_url.trim_end_matches('/');
+    let model = req.model.trim();
+    if model.is_empty() {
+        return Err("Model name is empty.".into());
+    }
+    let url = format!("{base}/api/pull");
+    let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(900).clamp(60, 7200));
+
+    let client = reqwest::Client::builder()
+        .user_agent("HoloBro-LLM/0.1")
+        .timeout(timeout)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    let mut builder = client
+        .post(&url)
+        .json(&serde_json::json!({ "name": model }));
+
+    if let Some(ref k) = req.api_key {
+        let t = k.trim();
+        if !t.is_empty() {
+            builder = builder.header("Authorization", format!("Bearer {t}"));
+        }
+    }
+
+    let res = builder.send().await.map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        return Err(format!(
+            "Pull HTTP {}: {}",
+            res.status(),
+            res.text().await.unwrap_or_default()
+        ));
+    }
+
+    let mut stream = res.bytes_stream();
+    let mut buf = String::new();
+    let mut last_status = String::from("starting…");
+    let mut saw_success = false;
+
+    fn consume_line(line: &str, last: &mut String, success: &mut bool) {
+        let line = line.trim();
+        if line.is_empty() {
+            return;
+        }
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+            if let Some(s) = v.get("status").and_then(|x| x.as_str()) {
+                *last = s.to_string();
+            }
+            if v.get("status").and_then(|x| x.as_str()) == Some("success") {
+                *success = true;
+            }
+            if let Some(err) = v.get("error") {
+                *last = format!("error: {err}");
+            }
+        }
+    }
+
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| e.to_string())?;
+        buf.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(pos) = buf.find('\n') {
+            let line = buf[..pos].to_string();
+            buf = buf[pos + 1..].to_string();
+            consume_line(&line, &mut last_status, &mut saw_success);
+        }
+    }
+    for line in buf.lines() {
+        consume_line(line, &mut last_status, &mut saw_success);
+    }
+
+    if saw_success {
+        Ok(format!("Pull finished successfully. Last status: {last_status}"))
+    } else {
+        Ok(format!(
+            "Pull stream ended (verify in Ollama). Last status: {last_status}"
+        ))
+    }
+}
+
+fn openai_message_content(v: &serde_json::Value) -> String {
+    match v {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(parts) => parts
+            .iter()
+            .filter_map(|p| {
+                p.get("text")
+                    .and_then(|t| t.as_str())
+                    .map(|s| s.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => v.as_str().unwrap_or(&v.to_string()).to_string(),
+    }
+}
+
+/// Chat: Ollama `/api/chat` or OpenAI-compatible `/v1/chat/completions`.
+#[tauri::command]
+async fn llm_chat(req: LlmChatRequest) -> Result<String, String> {
+    let base = req.base_url.trim_end_matches('/');
+    let provider = req.provider.as_deref().unwrap_or("ollama");
+    let timeout = llm_timeout(req.timeout_secs);
+
+    let client = reqwest::Client::builder()
+        .user_agent("HoloBro-LLM/0.1")
+        .timeout(timeout)
+        .build()
+        .map_err(|e| e.to_string())?;
+
+    if provider == "openai" {
+        let url = format!("{base}/v1/chat/completions");
+        let body = serde_json::json!({
+            "model": req.model,
+            "messages": [{ "role": "user", "content": req.message }],
+            "stream": false
+        });
+        let mut b = client.post(&url).json(&body);
+        if let Some(h) = auth_header(&req) {
+            b = b.header("Authorization", h);
+        }
+        let res = b.send().await.map_err(|e| e.to_string())?;
+        if !res.status().is_success() {
+            return Err(format!(
+                "LLM HTTP {}: {}",
+                res.status(),
+                res.text().await.unwrap_or_default()
+            ));
+        }
+        let parsed: OpenAiChatResponse = res.json().await.map_err(|e| e.to_string())?;
+        let content = parsed
+            .choices
+            .first()
+            .and_then(|c| c.message.content.as_ref())
+            .map(openai_message_content)
+            .unwrap_or_default();
+        return Ok(content);
+    }
+
+    let url = format!("{base}/api/chat");
+    let body = serde_json::json!({
+        "model": req.model,
+        "messages": [{ "role": "user", "content": req.message }],
+        "stream": false
+    });
+    let mut b = client.post(&url).json(&body);
+    if let Some(h) = auth_header(&req) {
+        b = b.header("Authorization", h);
+    }
+    let res = b.send().await.map_err(|e| e.to_string())?;
+    if !res.status().is_success() {
+        return Err(format!(
+            "LLM HTTP {}: {}",
+            res.status(),
+            res.text().await.unwrap_or_default()
+        ));
+    }
+    let parsed: OllamaChatResponse = res.json().await.map_err(|e| e.to_string())?;
+    Ok(parsed.message.content)
+}
+
+#[cfg_attr(mobile, tauri::mobile_entry_point)]
+pub fn run() {
+    tauri::Builder::default()
+        .plugin(tauri_plugin_opener::init())
+        .invoke_handler(tauri::generate_handler![
+            content_webview_ensure,
+            content_webview_set_bounds,
+            content_webview_navigate,
+            content_webview_back,
+            content_webview_forward,
+            content_webview_reload,
+            content_webview_hard_reload,
+            content_webview_stop,
+            content_webview_set_zoom,
+            content_webview_print,
+            content_webview_find,
+            content_webview_hide,
+            content_webview_show,
+            fetch_url_bridge,
+            llm_health,
+            llm_list_models,
+            llm_pull_ollama,
+            llm_chat,
+            network_tools::net_ip_stats,
+            network_tools::net_traceroute,
+            network_tools::net_speed_test
+        ])
+        .run(tauri::generate_context!())
+        .expect("error while running tauri application");
+}

@@ -1,0 +1,13 @@
+[package]
+name = "anon_browser"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "anon_browser"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+anon_browser_integrity = { path = "../../integrity/anon_browser_integrity" }
+hdk = { workspace = true }
+serde = { workspace = true }
