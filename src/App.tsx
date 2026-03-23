@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { Component, useCallback, useEffect, useMemo, useRef, useState, type ErrorInfo, type ReactNode } from 'react'
 import {
   encodeHashToBase64,
   type ActionHash,
@@ -29,17 +29,18 @@ import {
   type ContactRow,
 } from './holochain'
 import { AssistantPanel } from './assistant/AssistantPanel'
-import { NetworkToolsPanel, type IpStatsResult } from './network/NetworkToolsPanel'
+import { NetworkToolsPanel } from './network/NetworkToolsPanel'
 import { IrcDockPanel } from './irc/IrcDockPanel'
+import { TerminalMiniDock } from './terminal/TerminalMiniDock'
+import { WeatherPanel } from './weather/WeatherPanel'
 import { HoloBroLogo } from './components/HoloBroLogo'
 import { StreetTags } from './components/StreetTags'
 import { attachLocalVideo, createPeerConnection, wireRemoteStream } from './webrtc'
 import './App.css'
 
-type Tab = 'browser' | 'bookmarks' | 'contacts' | 'chat' | 'video' | 'assistant' | 'network'
+type Tab = 'browser' | 'bookmarks' | 'contacts' | 'chat' | 'video' | 'assistant' | 'network' | 'weather'
 
 type ContactDisplay = { id: string; name: string; peerKey: string; proof: string }
-type NetBadgeInfo = { hostname: string; localIp: string; wanIp: string }
 
 const LS_BOOKMARKS = 'holobro-demo-bookmarks'
 const LS_BOOKMARKS_LEGACY = 'hab-demo-bookmarks'
@@ -77,7 +78,7 @@ function normalizeUrl(raw: string): string {
   return `https://${trimmed}`
 }
 
-function App() {
+function AppShell() {
   const [tab, setTab] = useState<Tab>('browser')
   const [hc, setHc] = useState<AppWebsocket | null>(null)
   const [hcStatus, setHcStatus] = useState<string>('Disconnected (demo storage)')
@@ -111,11 +112,6 @@ function App() {
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const [videoPeerB64, setVideoPeerB64] = useState('')
   const [videoLog, setVideoLog] = useState<string[]>([])
-  const [netBadge, setNetBadge] = useState<NetBadgeInfo>({
-    hostname: 'loading…',
-    localIp: '—',
-    wanIp: '—',
-  })
 
   useEffect(() => {
     void (async () => {
@@ -151,35 +147,6 @@ function App() {
   useEffect(() => {
     saveJson(LS_CHAT, demoChat)
   }, [demoChat])
-
-  useEffect(() => {
-    let cancelled = false
-    const refresh = async () => {
-      try {
-        const stats = await invoke<IpStatsResult>('net_ip_stats')
-        if (cancelled) return
-        const localCandidate =
-          stats.interfaces.find((i) => i.family === 'ipv4' && !i.isLoopback)?.addr ||
-          stats.interfaces.find((i) => !i.isLoopback)?.addr ||
-          stats.interfaces[0]?.addr ||
-          '—'
-        setNetBadge({
-          hostname: stats.hostname || '(unknown)',
-          localIp: localCandidate,
-          wanIp: stats.public?.ip || '—',
-        })
-      } catch {
-        if (cancelled) return
-        setNetBadge((p) => ({ ...p, wanIp: 'unavailable' }))
-      }
-    }
-    void refresh()
-    const t = window.setInterval(() => void refresh(), 60_000)
-    return () => {
-      cancelled = true
-      window.clearInterval(t)
-    }
-  }, [])
 
   const refreshThread = useCallback(async () => {
     if (!hc) return
@@ -375,42 +342,41 @@ function App() {
         <nav className="nav">
           {(
             [
-              ['browser', 'Browser'],
-              ['bookmarks', 'Bookmarks'],
-              ['contacts', 'Contacts'],
-              ['chat', 'Chat'],
-              ['video', 'Video'],
-              ['assistant', 'Assistant'],
-              ['network', 'Network'],
+              ['browser', 'Browser', '>>'],
+              ['bookmarks', 'Bookmarks', '##'],
+              ['contacts', 'Contacts', '@@'],
+              ['chat', 'Chat', '//'],
+              ['video', 'Video', '[]'],
+              ['weather', 'Weather', '**'],
+              ['assistant', 'Assistant', 'AI'],
+              ['network', 'Network', '::'],
             ] as const
-          ).map(([id, label]) => (
+          ).map(([id, label, icon]) => (
             <button
               key={id}
               type="button"
               className={tab === id ? 'nav-btn active' : 'nav-btn'}
               onClick={() => setTab(id)}
             >
-              {label}
+              <span className="nav-icon" aria-hidden="true">{icon}</span>
+              <span>{label}</span>
             </button>
           ))}
         </nav>
         <main className="main">
           {tab === 'browser' && (
-            <>
-              <BrowserPanel
-                url={url}
-                setUrl={setUrl}
-                settings={browserSettings}
-                onSettingsChange={setBrowserSettings}
-                onBookmark={() => void addBookmark()}
-                onFetchBridge={() => void fetchReader()}
-                fetchResult={fetchResult}
-                fetchErr={fetchErr}
-                fetchBusy={fetchBusy}
-                active={tab === 'browser'}
-              />
-              <IrcDockPanel />
-            </>
+            <BrowserPanel
+              url={url}
+              setUrl={setUrl}
+              settings={browserSettings}
+              onSettingsChange={setBrowserSettings}
+              onBookmark={() => void addBookmark()}
+              onFetchBridge={() => void fetchReader()}
+              fetchResult={fetchResult}
+              fetchErr={fetchErr}
+              fetchBusy={fetchBusy}
+              active={tab === 'browser'}
+            />
           )}
           {tab === 'bookmarks' && (
             <section className="panel">
@@ -504,6 +470,7 @@ function App() {
               <p className="hint">
                 Encrypt message bodies client-side before production; the DNA stores opaque text for now.
               </p>
+              <IrcDockPanel />
             </section>
           )}
           {tab === 'video' && (
@@ -540,23 +507,46 @@ function App() {
               </ul>
             </section>
           )}
+          {tab === 'weather' && <WeatherPanel />}
           {tab === 'assistant' && <AssistantPanel />}
           {tab === 'network' && <NetworkToolsPanel />}
         </main>
       </div>
-      <aside className="corner-net-badge" aria-label="Current host network identity">
-        <span className="badge-row">
-          <strong>Host</strong> <span className="mono">{netBadge.hostname}</span>
-        </span>
-        <span className="badge-row">
-          <strong>LAN</strong> <span className="mono">{netBadge.localIp}</span>
-        </span>
-        <span className="badge-row">
-          <strong>WAN</strong> <span className="mono">{netBadge.wanIp}</span>
-        </span>
-      </aside>
+      <TerminalMiniDock />
     </div>
   )
+}
+
+class RootErrorBoundary extends Component<{ children: ReactNode }, { error: string | null }> {
+  constructor(props: { children: ReactNode }) {
+    super(props)
+    this.state = { error: null }
+  }
+
+  static getDerivedStateFromError(err: unknown) {
+    return { error: err instanceof Error ? err.message : String(err) }
+  }
+
+  componentDidCatch(error: unknown, info: ErrorInfo) {
+    console.error('UI crash:', error, info.componentStack)
+  }
+
+  render() {
+    if (this.state.error) {
+      return (
+        <div className="app">
+          <section className="panel">
+            <h2>Runtime error</h2>
+            <p className="error">
+              {this.state.error}
+            </p>
+            <p className="hint">Open dev logs and share this message so it can be fixed quickly.</p>
+          </section>
+        </div>
+      )
+    }
+    return this.props.children
+  }
 }
 
 function ContactForm({
@@ -592,4 +582,10 @@ function ContactForm({
   )
 }
 
-export default App
+export default function App() {
+  return (
+    <RootErrorBoundary>
+      <AppShell />
+    </RootErrorBoundary>
+  )
+}

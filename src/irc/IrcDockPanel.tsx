@@ -230,7 +230,7 @@ export function IrcDockPanel() {
         <span className={connected ? 'irc-state live' : 'irc-state'}>{connected ? 'LIVE' : 'OFFLINE'}</span>
       </div>
       <p className="hint">
-        Chat while browsing: connect to EFnet, Darknet, or 3 more networks. Type plain text to send to current channel, or slash commands.
+        Connect to EFnet, Darknet, LiberaChat, OFTC, or QuakeNet. Type plain text to send to current channel, or slash commands.
       </p>
 
       <div className="irc-grid">

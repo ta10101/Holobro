@@ -1,4 +1,4 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
 
 export type IpInterfaceRow = {
@@ -59,6 +59,25 @@ export type NmapScanResult = {
   stdout: string
   stderr: string
   exitCode: number | null
+}
+
+export type RuntimeDiagnostics = {
+  os: string
+  tracerouteAvailable: boolean
+  tracerouteTool?: string
+  nmapAvailable: boolean
+  nmapPath?: string
+  shellAvailable: boolean
+  shellName?: string
+  nmapInstallHint: string
+  tracerouteHint: string
+  notes: string[]
+}
+
+type NetIdentity = {
+  hostname: string
+  localIp: string
+  wanIp: string
 }
 
 type NmapPreset = {
@@ -167,6 +186,11 @@ export function NetworkToolsPanel() {
   const [ipBusy, setIpBusy] = useState(false)
   const [ipErr, setIpErr] = useState<string | null>(null)
   const [ipStats, setIpStats] = useState<IpStatsResult | null>(null)
+  const [identity, setIdentity] = useState<NetIdentity>({
+    hostname: 'loading…',
+    localIp: '—',
+    wanIp: '—',
+  })
 
   const [traceHost, setTraceHost] = useState('1.1.1.1')
   const [traceHops, setTraceHops] = useState(20)
@@ -205,6 +229,9 @@ export function NetworkToolsPanel() {
   const [nmapBusy, setNmapBusy] = useState(false)
   const [nmapErr, setNmapErr] = useState<string | null>(null)
   const [nmapOut, setNmapOut] = useState<NmapScanResult | null>(null)
+  const [diagBusy, setDiagBusy] = useState(false)
+  const [diagErr, setDiagErr] = useState<string | null>(null)
+  const [diag, setDiag] = useState<RuntimeDiagnostics | null>(null)
 
   const refreshIp = useCallback(async () => {
     setIpBusy(true)
@@ -212,9 +239,20 @@ export function NetworkToolsPanel() {
     try {
       const r = await invoke<IpStatsResult>('net_ip_stats')
       setIpStats(r)
+      const localCandidate =
+        r.interfaces.find((i) => i.family === 'ipv4' && !i.isLoopback)?.addr ||
+        r.interfaces.find((i) => !i.isLoopback)?.addr ||
+        r.interfaces[0]?.addr ||
+        '—'
+      setIdentity({
+        hostname: r.hostname || '(unknown)',
+        localIp: localCandidate,
+        wanIp: r.public?.ip || '—',
+      })
     } catch (e) {
       setIpErr(String(e))
       setIpStats(null)
+      setIdentity((prev) => ({ ...prev, wanIp: 'unavailable' }))
     } finally {
       setIpBusy(false)
     }
@@ -324,6 +362,30 @@ export function NetworkToolsPanel() {
     }
   }, [nmapTarget, nmapProfile, nmapPorts, nmapTiming, nmapExtra])
 
+  const refreshDiagnostics = useCallback(async () => {
+    setDiagBusy(true)
+    setDiagErr(null)
+    try {
+      const r = await invoke<RuntimeDiagnostics>('net_runtime_diagnostics')
+      setDiag(r)
+    } catch (e) {
+      setDiagErr(String(e))
+      setDiag(null)
+    } finally {
+      setDiagBusy(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    void refreshIp()
+    const t = window.setInterval(() => void refreshIp(), 60_000)
+    return () => window.clearInterval(t)
+  }, [refreshIp])
+
+  useEffect(() => {
+    void refreshDiagnostics()
+  }, [refreshDiagnostics])
+
   const selectedNmapPreset =
     NMAP_PRESETS.find((p) => p.id === nmapPresetId) ?? NMAP_PRESETS[0]
 
@@ -340,12 +402,69 @@ export function NetworkToolsPanel() {
   return (
     <section className="panel network-tools-panel">
       <h2 className="network-tools-title">Network lab</h2>
+      <aside className="network-identity-badge" aria-label="Current host network identity">
+        <span className="badge-row">
+          <strong>Host</strong> <span className="mono">{identity.hostname}</span>
+        </span>
+        <span className="badge-row">
+          <strong>LAN</strong> <span className="mono">{identity.localIp}</span>
+        </span>
+        <span className="badge-row">
+          <strong>WAN</strong> <span className="mono">{identity.wanIp}</span>
+        </span>
+      </aside>
       <p className="hint">
         Traceroute uses your OS (<code>tracert</code> / <code>traceroute</code>). DNS uses the system resolver (hickory).
         BGP snapshot comes from BGPView; RDAP uses the rdap.org bootstrap — not a live interactive looking glass.
       </p>
 
       <div className="network-tools-grid">
+        <article className="network-card net-tools-chrome network-card-wide">
+          <h3>Dependency health</h3>
+          <p className="muted network-card-desc">
+            OS-aware checks so users see tool names and install hints before scans fail.
+          </p>
+          <button type="button" disabled={diagBusy} onClick={() => void refreshDiagnostics()}>
+            {diagBusy ? 'Checking…' : 'Refresh checks'}
+          </button>
+          {diagErr ? <p className="error">{diagErr}</p> : null}
+          {diag ? (
+            <div className="network-diag-grid">
+              <p>
+                <strong>OS</strong> <span className="mono">{diag.os}</span>
+              </p>
+              <p>
+                <strong>Traceroute</strong>{' '}
+                <span className={diag.tracerouteAvailable ? 'network-ok-badge' : 'network-miss-badge'}>
+                  {diag.tracerouteAvailable ? `Ready (${diag.tracerouteTool ?? 'tool'})` : 'Missing'}
+                </span>
+              </p>
+              <p className="muted">{diag.tracerouteHint}</p>
+              <p>
+                <strong>Nmap</strong>{' '}
+                <span className={diag.nmapAvailable ? 'network-ok-badge' : 'network-miss-badge'}>
+                  {diag.nmapAvailable ? 'Ready' : 'Missing'}
+                </span>{' '}
+                {diag.nmapPath ? <span className="mono">{diag.nmapPath}</span> : null}
+              </p>
+              {!diag.nmapAvailable ? <p className="muted mono">{diag.nmapInstallHint}</p> : null}
+              <p>
+                <strong>Shell</strong>{' '}
+                <span className={diag.shellAvailable ? 'network-ok-badge' : 'network-miss-badge'}>
+                  {diag.shellAvailable ? `Ready (${diag.shellName ?? 'shell'})` : 'Missing'}
+                </span>
+              </p>
+              {diag.notes.length ? (
+                <ul className="network-warnings">
+                  {diag.notes.map((n) => (
+                    <li key={n}>{n}</li>
+                  ))}
+                </ul>
+              ) : null}
+            </div>
+          ) : null}
+        </article>
+
         <article className="network-card net-tools-chrome">
           <h3>IP & interfaces</h3>
           <p className="muted network-card-desc">Machine name, local addresses, and public IP (via ipwho.is).</p>
@@ -540,10 +659,15 @@ export function NetworkToolsPanel() {
                 onChange={(e) => setTraceHops(Number(e.target.value) || 20)}
               />
             </label>
-            <button type="button" disabled={traceBusy} onClick={() => void runTrace()}>
+            <button
+              type="button"
+              disabled={traceBusy || (diag ? !diag.tracerouteAvailable : false)}
+              onClick={() => void runTrace()}
+            >
               {traceBusy ? 'Running…' : 'Run'}
             </button>
           </div>
+          {diag && !diag.tracerouteAvailable ? <p className="error">{diag.tracerouteHint}</p> : null}
           {traceErr ? <p className="error">{traceErr}</p> : null}
           {traceOut ? (
             <div className="network-trace-out">
@@ -630,10 +754,15 @@ export function NetworkToolsPanel() {
               placeholder="Extra args, e.g. --script vuln --reason (optional)"
               aria-label="Nmap extra args"
             />
-            <button type="button" disabled={nmapBusy} onClick={() => void runNmap()}>
+            <button
+              type="button"
+              disabled={nmapBusy || (diag ? !diag.nmapAvailable : false)}
+              onClick={() => void runNmap()}
+            >
               {nmapBusy ? 'Scanning…' : 'Run nmap'}
             </button>
           </div>
+          {diag && !diag.nmapAvailable ? <p className="error mono">{diag.nmapInstallHint}</p> : null}
           {nmapErr ? <p className="error">{nmapErr}</p> : null}
           {nmapOut ? (
             <div className="network-trace-out">

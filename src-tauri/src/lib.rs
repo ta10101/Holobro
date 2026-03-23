@@ -16,9 +16,6 @@ const MAX_FETCH_BYTES: usize = 2 * 1024 * 1024;
 const DEFAULT_FETCH_TIMEOUT_SECS: u64 = 45;
 const CONTENT_WEBVIEW_LABEL: &str = "content";
 
-/// Injected at document start on all frames: block getUserMedia / enumerateDevices stubs and neuter RTCPeerConnection (best-effort anti-IP-leak).
-const PRIVACY_INIT_SCRIPT: &str = r#"(function(){try{var REJ=function(){return Promise.reject(new DOMException("Not allowed","NotAllowedError"))};if(navigator.mediaDevices){navigator.mediaDevices.getUserMedia=REJ;navigator.mediaDevices.getDisplayMedia=REJ;navigator.mediaDevices.enumerateDevices=function(){return Promise.resolve([])}}function Block(){throw new DOMException("WebRTC disabled","NotSupportedError")}Block.prototype={};["RTCPeerConnection","webkitRTCPeerConnection","mozRTCPeerConnection"].forEach(function(k){if(window[k])window[k]=Block})}catch(e){}})();"#;
-
 /// Generic desktop Chrome UA (no custom product token) — only used when user turns off stealth / engine-default UA.
 const GENERIC_CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
 
@@ -31,6 +28,9 @@ pub struct ContentPrivacySettings {
     /// Inject WebRTC / media hardening script on all frames.
     #[serde(default = "default_true")]
     pub block_webrtc: bool,
+    /// Best-effort ad/tracker request + element blocking in embedded pages.
+    #[serde(default = "default_true")]
+    pub block_ads: bool,
     /// Route the embedded webview through HTTP or SOCKS5 proxy (e.g. Tor `socks5://127.0.0.1:9050`).
     #[serde(default)]
     pub use_proxy: bool,
@@ -53,10 +53,23 @@ fn default_content_privacy() -> ContentPrivacySettings {
     ContentPrivacySettings {
         stealth_user_agent: true,
         block_webrtc: true,
+        block_ads: true,
         use_proxy: false,
         proxy_url: default_tor_socks(),
         incognito: true,
     }
+}
+
+fn privacy_init_script(block_webrtc: bool, block_ads: bool) -> String {
+    let mut s = String::from("(function(){try{");
+    if block_webrtc {
+        s.push_str(r#"var REJ=function(){return Promise.reject(new DOMException("Not allowed","NotAllowedError"))};if(navigator.mediaDevices){navigator.mediaDevices.getUserMedia=REJ;navigator.mediaDevices.getDisplayMedia=REJ;navigator.mediaDevices.enumerateDevices=function(){return Promise.resolve([])}}function Block(){throw new DOMException("WebRTC disabled","NotSupportedError")}Block.prototype={};["RTCPeerConnection","webkitRTCPeerConnection","mozRTCPeerConnection"].forEach(function(k){if(window[k])window[k]=Block});"#);
+    }
+    if block_ads {
+        s.push_str(r#"var AD_HOSTS=["doubleclick.net","googlesyndication.com","googleadservices.com","adservice.google.com","adservice.google.dk","googletagmanager.com","google-analytics.com","facebook.net","ads-twitter.com","taboola.com","outbrain.com","adnxs.com","scorecardresearch.com"];var hbBlockedHost=function(u){try{var h=(new URL(u,location.href)).hostname.toLowerCase();for(var i=0;i<AD_HOSTS.length;i++){var d=AD_HOSTS[i];if(h===d||h.endsWith("."+d))return true}return false}catch(_){return false}};var hbFetch=window.fetch;if(hbFetch){window.fetch=function(input,init){var u=typeof input==="string"?input:(input&&input.url?input.url:"");if(u&&hbBlockedHost(u)){return Promise.resolve(new Response("",{status:204,statusText:"Blocked"}))}return hbFetch.apply(this,arguments)}};var hbOpen=XMLHttpRequest.prototype.open;var hbSend=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(method,url){this.__hbUrl=url;return hbOpen.apply(this,arguments)};XMLHttpRequest.prototype.send=function(body){if(this.__hbUrl&&hbBlockedHost(this.__hbUrl)){try{this.abort()}catch(_){}return}return hbSend.apply(this,arguments)};var css=document.createElement("style");css.textContent="[id*='ad-'],[class*='ad-'],[class*='ads-'],[class*='advert'],[id*='sponsor'],[class*='sponsor'],iframe[src*='doubleclick'],iframe[src*='googlesyndication'],iframe[src*='adservice'],.adsbygoogle{display:none!important;visibility:hidden!important;max-height:0!important;min-height:0!important;}";document.documentElement.appendChild(css);"#);
+    }
+    s.push_str("}catch(e){}})();");
+    s
 }
 
 #[derive(Debug, Deserialize)]
@@ -220,8 +233,11 @@ async fn content_webview_ensure(app: tauri::AppHandle, req: ContentWebviewEnsure
         builder = builder.user_agent(GENERIC_CHROME_UA);
     }
 
-    if privacy.block_webrtc {
-        builder = builder.initialization_script_for_all_frames(PRIVACY_INIT_SCRIPT);
+    if privacy.block_webrtc || privacy.block_ads {
+        builder = builder.initialization_script_for_all_frames(&privacy_init_script(
+            privacy.block_webrtc,
+            privacy.block_ads,
+        ));
     }
 
     if privacy.use_proxy {
@@ -503,6 +519,11 @@ async fn shell_exec(req: ShellExecRequest) -> Result<ShellExecResult, String> {
     let mut cmd = if cfg!(windows) {
         let mut c = tokio::process::Command::new("cmd");
         c.arg("/C").arg(command);
+        #[cfg(windows)]
+        {
+            // Keep in-app terminal execution hidden (no flashing external console window).
+            c.creation_flags(0x08000000);
+        }
         c
     } else {
         let mut c = tokio::process::Command::new("sh");
@@ -881,6 +902,7 @@ pub fn run() {
             llm_pull_ollama,
             llm_chat,
             network_tools::net_ip_stats,
+            network_tools::net_runtime_diagnostics,
             network_tools::net_traceroute,
             network_tools::net_speed_test,
             network_tools::net_dns_lookup,

@@ -25,6 +25,8 @@ export type BrowserSettings = {
   stealthUserAgent: boolean
   /** Document-start script: block WebRTC constructors & lock down getUserMedia (best-effort). */
   privacyHardenContent: boolean
+  /** Best-effort ad/tracker filtering for embedded pages. */
+  blockAdsContent: boolean
   /** Non-persistent WebView2 profile for the embedded page. */
   contentIncognito: boolean
 }
@@ -120,6 +122,7 @@ export function loadBrowserSettings(): BrowserSettings {
         fetchMaxKb: 2048,
         stealthUserAgent: true,
         privacyHardenContent: true,
+        blockAdsContent: true,
         contentIncognito: true,
       }
     }
@@ -142,6 +145,7 @@ export function loadBrowserSettings(): BrowserSettings {
         typeof p.fetchMaxKb === 'number' ? Math.min(2048, Math.max(16, Math.round(p.fetchMaxKb))) : 2048,
       stealthUserAgent: typeof p.stealthUserAgent === 'boolean' ? p.stealthUserAgent : true,
       privacyHardenContent: typeof p.privacyHardenContent === 'boolean' ? p.privacyHardenContent : true,
+      blockAdsContent: typeof p.blockAdsContent === 'boolean' ? p.blockAdsContent : true,
       contentIncognito: typeof p.contentIncognito === 'boolean' ? p.contentIncognito : true,
     }
   } catch {
@@ -155,6 +159,7 @@ export function loadBrowserSettings(): BrowserSettings {
       fetchMaxKb: 2048,
       stealthUserAgent: true,
       privacyHardenContent: true,
+      blockAdsContent: true,
       contentIncognito: true,
     }
   }
@@ -192,13 +197,6 @@ export type BrowserPanelProps = {
   active: boolean
 }
 
-type ShellExecResult = {
-  command: string
-  stdout: string
-  stderr: string
-  exitCode: number | null
-}
-
 export function BrowserPanel({
   url,
   setUrl,
@@ -220,12 +218,6 @@ export function BrowserPanel({
   const [status, setStatus] = useState('Embedded page area below — click Go to load.')
   const [clipboardNote, setClipboardNote] = useState<string | null>(null)
   const [fetchPreviewExpanded, setFetchPreviewExpanded] = useState(false)
-  const [termCommand, setTermCommand] = useState('ipconfig')
-  const [termCwd, setTermCwd] = useState('')
-  const [termBusy, setTermBusy] = useState(false)
-  const [termOut, setTermOut] = useState<ShellExecResult | null>(null)
-  const [termErr, setTermErr] = useState<string | null>(null)
-  const [termHistory, setTermHistory] = useState<string[]>([])
 
   useEffect(() => {
     if (!clipboardNote) return
@@ -363,6 +355,7 @@ export function BrowserPanel({
           privacy: {
             stealthUserAgent: settings.stealthUserAgent,
             blockWebrtc: settings.privacyHardenContent,
+            blockAds: settings.blockAdsContent,
             useProxy: isContentProxyActive(settings),
             proxyUrl: effectiveContentProxyUrl(settings),
             incognito: settings.contentIncognito,
@@ -474,6 +467,38 @@ export function BrowserPanel({
     }
   }, [])
 
+  const toggleWebRtcHardening = useCallback(() => {
+    const next = { ...settings, privacyHardenContent: !settings.privacyHardenContent }
+    onSettingsChange(next)
+    saveBrowserSettings(next)
+    setStatus(
+      next.privacyHardenContent
+        ? 'WebRTC hardening enabled. Press Go to rebuild embedded page with this setting.'
+        : 'WebRTC hardening disabled. Press Go to rebuild embedded page with this setting.',
+    )
+  }, [settings, onSettingsChange])
+
+  const toggleAdBlocking = useCallback(() => {
+    const next = { ...settings, blockAdsContent: !settings.blockAdsContent }
+    onSettingsChange(next)
+    saveBrowserSettings(next)
+    setStatus(
+      next.blockAdsContent
+        ? 'Ad block enabled. Press Go to rebuild embedded page with this setting.'
+        : 'Ad block disabled. Press Go to rebuild embedded page with this setting.',
+    )
+  }, [settings, onSettingsChange])
+
+  const runNavCommand = useCallback(async (command: string, okLabel: string) => {
+    try {
+      await invoke(command)
+      setStatus(okLabel)
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e)
+      setStatus(`${okLabel} failed: ${msg}`)
+    }
+  }, [])
+
   const fetchBodyPreview = fetchResult
     ? fetchPreviewExpanded
       ? fetchResult.body
@@ -481,47 +506,43 @@ export function BrowserPanel({
         (fetchResult.body.length > PREVIEW_LIMIT ? '…' : '')
     : ''
 
-  const runTerminal = useCallback(async () => {
-    setTermBusy(true)
-    setTermErr(null)
-    setTermOut(null)
-    try {
-      const r = await invoke<ShellExecResult>('shell_exec', {
-        req: {
-          command: termCommand,
-          cwd: termCwd.trim() || undefined,
-          timeoutSecs: 90,
-        },
-      })
-      setTermOut(r)
-      setTermHistory((prev) => {
-        const cleaned = prev.filter((x) => x !== termCommand)
-        return [termCommand, ...cleaned].slice(0, 12)
-      })
-    } catch (e) {
-      setTermErr(String(e))
-    } finally {
-      setTermBusy(false)
-    }
-  }, [termCommand, termCwd])
-
   return (
     <section className="panel browser-panel">
       <div className="browser-chrome">
         <div className="browser-nav-row browser-nav-primary">
-          <button type="button" title="Back (Alt+←)" onClick={() => void invoke('content_webview_back')}>
+          <button
+            type="button"
+            title="Back (Alt+←)"
+            onClick={() => void runNavCommand('content_webview_back', 'Back')}
+          >
             ←
           </button>
-          <button type="button" title="Forward" onClick={() => void invoke('content_webview_forward')}>
+          <button
+            type="button"
+            title="Forward"
+            onClick={() => void runNavCommand('content_webview_forward', 'Forward')}
+          >
             →
           </button>
-          <button type="button" title="Reload" onClick={() => void invoke('content_webview_reload')}>
+          <button
+            type="button"
+            title="Reload"
+            onClick={() => void runNavCommand('content_webview_reload', 'Reload requested')}
+          >
             ↻
           </button>
-          <button type="button" title="Hard reload (Ctrl+Shift+R)" onClick={() => void invoke('content_webview_hard_reload')}>
+          <button
+            type="button"
+            title="Hard reload (Ctrl+Shift+R)"
+            onClick={() => void runNavCommand('content_webview_hard_reload', 'Hard reload requested')}
+          >
             ⟳
           </button>
-          <button type="button" title="Stop loading" onClick={() => void invoke('content_webview_stop')}>
+          <button
+            type="button"
+            title="Stop loading"
+            onClick={() => void runNavCommand('content_webview_stop', 'Stop requested')}
+          >
             ■
           </button>
           <input
@@ -582,6 +603,16 @@ export function BrowserPanel({
           <button type="button" title="Print (Ctrl+P)" onClick={() => void triggerPrint()}>
             Print
           </button>
+          <button
+            type="button"
+            title="Toggle WebRTC hardening for embedded page"
+            onClick={toggleWebRtcHardening}
+          >
+            WebRTC {settings.privacyHardenContent ? 'Off' : 'On'}
+          </button>
+          <button type="button" title="Toggle ad blocking for embedded page" onClick={toggleAdBlocking}>
+            Ads {settings.blockAdsContent ? 'Off' : 'On'}
+          </button>
           <button type="button" onClick={() => setSettingsOpen(true)}>
             Settings
           </button>
@@ -634,6 +665,11 @@ export function BrowserPanel({
             title={`Embedded page uses proxy (${settings.contentProxyPreset})`}
           >
             Proxy: {settings.contentProxyPreset}
+          </span>
+        ) : null}
+        {settings.blockAdsContent ? (
+          <span className="privacy-badge" title="Best-effort ad/tracker filtering is enabled">
+            Ad block
           </span>
         ) : null}
       </div>
@@ -704,52 +740,6 @@ export function BrowserPanel({
         </div>
       )}
 
-      <section className="browser-terminal">
-        <h3>Terminal</h3>
-        <p className="hint">Run shell commands without leaving the browser tab.</p>
-        <div className="row">
-          {termHistory.length ? (
-            <label>
-              History
-              <select value="" onChange={(e) => e.target.value && setTermCommand(e.target.value)}>
-                <option value="">Recent commands…</option>
-                {termHistory.map((cmd) => (
-                  <option key={cmd} value={cmd}>
-                    {cmd}
-                  </option>
-                ))}
-              </select>
-            </label>
-          ) : null}
-          <input
-            className="wide"
-            value={termCommand}
-            onChange={(e) => setTermCommand(e.target.value)}
-            onKeyDown={(e) => e.key === 'Enter' && void runTerminal()}
-            placeholder="Command (e.g. ipconfig /all, nmap -sV scanme.nmap.org)"
-          />
-          <input
-            value={termCwd}
-            onChange={(e) => setTermCwd(e.target.value)}
-            placeholder="Working directory (optional)"
-          />
-          <button type="button" disabled={termBusy} onClick={() => void runTerminal()}>
-            {termBusy ? 'Running…' : 'Run'}
-          </button>
-        </div>
-        {termErr ? <p className="error">{termErr}</p> : null}
-        {termOut ? (
-          <div className="network-trace-out">
-            <p className="muted mono network-trace-cmd">{termOut.command}</p>
-            {termOut.exitCode !== null && termOut.exitCode !== 0 ? (
-              <p className="error">Exit code {termOut.exitCode}</p>
-            ) : null}
-            <pre className="network-pre network-pre-large">{termOut.stdout || '(no stdout)'}</pre>
-            {termOut.stderr ? <pre className="network-pre network-pre-err">{termOut.stderr}</pre> : null}
-          </div>
-        ) : null}
-      </section>
-
       {settingsOpen && (
         <div
           className="modal-backdrop"
@@ -779,6 +769,14 @@ export function BrowserPanel({
                   onChange={(e) => onSettingsChange({ ...settings, privacyHardenContent: e.target.checked })}
                 />
                 Block WebRTC / lock media APIs (best-effort anti IP-leak)
+              </label>
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={settings.blockAdsContent}
+                  onChange={(e) => onSettingsChange({ ...settings, blockAdsContent: e.target.checked })}
+                />
+                Block common ad/tracker hosts and ad elements (best-effort)
               </label>
               <label className="check">
                 <input

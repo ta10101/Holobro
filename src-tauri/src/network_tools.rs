@@ -7,7 +7,15 @@ use hickory_resolver::proto::rr::RecordType;
 use hickory_resolver::TokioAsyncResolver;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+use std::path::Path;
 use std::time::Instant;
+
+fn hide_windows_console(cmd: &mut tokio::process::Command) {
+    #[cfg(windows)]
+    {
+        cmd.creation_flags(0x08000000);
+    }
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -110,6 +118,21 @@ pub struct NmapScanResult {
     pub stdout: String,
     pub stderr: String,
     pub exit_code: Option<i32>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeDiagnostics {
+    pub os: String,
+    pub traceroute_available: bool,
+    pub traceroute_tool: Option<String>,
+    pub nmap_available: bool,
+    pub nmap_path: Option<String>,
+    pub shell_available: bool,
+    pub shell_name: Option<String>,
+    pub nmap_install_hint: String,
+    pub traceroute_hint: String,
+    pub notes: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -229,6 +252,7 @@ pub async fn net_traceroute(req: TracerouteReq) -> Result<TracerouteResult, Stri
     let (mut cmd, label) = {
         let mut c = tokio::process::Command::new("tracert");
         c.arg("-d").arg("-h").arg(hops.to_string()).arg(host);
+        hide_windows_console(&mut c);
         (c, format!("tracert -d -h {hops} {host}"))
     };
 
@@ -390,16 +414,30 @@ fn nmap_profile_args(profile: &str) -> Vec<&'static str> {
     }
 }
 
+fn nmap_known_paths() -> Vec<String> {
+    #[cfg(windows)]
+    {
+        vec![
+            "nmap".to_string(),
+            r"C:\Program Files\Nmap\nmap.exe".to_string(),
+            r"C:\Program Files (x86)\Nmap\nmap.exe".to_string(),
+        ]
+    }
+    #[cfg(not(windows))]
+    {
+        vec!["nmap".to_string()]
+    }
+}
+
 fn nmap_command_path() -> String {
     #[cfg(windows)]
     {
-        let candidates = [
-            r"C:\Program Files\Nmap\nmap.exe",
-            r"C:\Program Files (x86)\Nmap\nmap.exe",
-        ];
-        for c in candidates {
-            if std::path::Path::new(c).exists() {
-                return c.to_string();
+        for c in nmap_known_paths() {
+            if c == "nmap" {
+                continue;
+            }
+            if Path::new(&c).exists() {
+                return c;
             }
         }
         "nmap".to_string()
@@ -408,6 +446,111 @@ fn nmap_command_path() -> String {
     {
         "nmap".to_string()
     }
+}
+
+async fn probe_command(command: &str, args: &[&str]) -> bool {
+    let mut cmd = tokio::process::Command::new(command);
+    cmd.args(args);
+    hide_windows_console(&mut cmd);
+    matches!(
+        tokio::time::timeout(std::time::Duration::from_secs(4), cmd.output()).await,
+        Ok(Ok(_))
+    )
+}
+
+/// Check runtime external-tool availability and provide platform-specific hints.
+#[tauri::command]
+pub async fn net_runtime_diagnostics() -> Result<RuntimeDiagnostics, String> {
+    #[cfg(windows)]
+    let os = "windows".to_string();
+    #[cfg(target_os = "macos")]
+    let os = "macos".to_string();
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let os = "linux".to_string();
+
+    let mut traceroute_available = false;
+    let mut traceroute_tool: Option<String> = None;
+    #[cfg(windows)]
+    {
+        if probe_command("tracert", &["/?"]).await {
+            traceroute_available = true;
+            traceroute_tool = Some("tracert".into());
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        if probe_command("traceroute", &["--help"]).await {
+            traceroute_available = true;
+            traceroute_tool = Some("traceroute".into());
+        } else if probe_command("tracepath", &["--help"]).await {
+            traceroute_available = true;
+            traceroute_tool = Some("tracepath".into());
+        }
+    }
+
+    let mut nmap_available = false;
+    let mut nmap_path: Option<String> = None;
+    for p in nmap_known_paths() {
+        if p != "nmap" && !Path::new(&p).exists() {
+            continue;
+        }
+        if probe_command(&p, &["--version"]).await {
+            nmap_available = true;
+            nmap_path = Some(p);
+            break;
+        }
+    }
+
+    #[cfg(windows)]
+    let (shell_available, shell_name) = if probe_command("cmd", &["/C", "echo", "ok"]).await {
+        (true, Some("cmd".to_string()))
+    } else {
+        (false, None)
+    };
+    #[cfg(not(windows))]
+    let (shell_available, shell_name) = if probe_command("sh", &["-lc", "echo ok"]).await {
+        (true, Some("sh".to_string()))
+    } else {
+        (false, None)
+    };
+
+    #[cfg(windows)]
+    let nmap_install_hint = "Install Nmap: winget install -e --id Insecure.Nmap".to_string();
+    #[cfg(target_os = "macos")]
+    let nmap_install_hint = "Install Nmap: brew install nmap".to_string();
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let nmap_install_hint = "Install Nmap: sudo apt install nmap  (or your distro package manager)".to_string();
+
+    #[cfg(windows)]
+    let traceroute_hint = "Windows uses `tracert` (already built-in on most systems).".to_string();
+    #[cfg(target_os = "macos")]
+    let traceroute_hint = "macOS uses `traceroute` (preinstalled).".to_string();
+    #[cfg(all(not(windows), not(target_os = "macos")))]
+    let traceroute_hint = "Linux uses `traceroute` (or `tracepath` on some distros).".to_string();
+
+    let mut notes = Vec::new();
+    if !nmap_available {
+        notes.push("Nmap not detected — Nmap panel will be limited until installed.".into());
+    }
+    if !traceroute_available {
+        notes.push("No traceroute tool detected — traceroute panel may fail.".into());
+    }
+    if !shell_available {
+        notes.push("Shell command runner unavailable — browser terminal may fail.".into());
+    }
+
+    Ok(RuntimeDiagnostics {
+        os,
+        traceroute_available,
+        traceroute_tool,
+        nmap_available,
+        nmap_path,
+        shell_available,
+        shell_name,
+        nmap_install_hint,
+        traceroute_hint,
+        notes,
+    })
 }
 
 /// Nmap scan wrapper. Requires `nmap` available on PATH.
@@ -458,6 +601,7 @@ pub async fn net_nmap_scan(req: NmapScanReq) -> Result<NmapScanResult, String> {
     let nmap_bin = nmap_command_path();
     let mut cmd = tokio::process::Command::new(&nmap_bin);
     cmd.args(&args);
+    hide_windows_console(&mut cmd);
     let command_line = format!("{} {}", nmap_bin, args.join(" "));
 
     let output = tokio::time::timeout(std::time::Duration::from_secs(600), cmd.output())

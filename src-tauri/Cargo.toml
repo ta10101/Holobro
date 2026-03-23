@@ -31,3 +31,7 @@ hickory-resolver = { version = "0.24", features = ["tokio-runtime", "system-conf
 native-tls = "0.2"
 tokio-native-tls = "0.3"
 
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+
