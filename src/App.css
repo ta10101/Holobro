@@ -446,6 +446,36 @@ body {
   color: var(--text);
 }
 
+.p2p-nav-card {
+  border: 1px solid rgba(91, 159, 212, 0.25);
+  border-radius: 10px;
+  background: rgba(8, 11, 16, 0.85);
+  padding: 0.4rem 0.45rem;
+}
+
+.p2p-nav-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.4rem;
+  margin-bottom: 0.25rem;
+}
+
+.p2p-nav-line {
+  margin: 0.16rem 0;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.35rem;
+  font-size: 0.72rem;
+}
+
+.p2p-nav-note {
+  margin: 0.35rem 0 0.4rem;
+  font-size: 0.72rem;
+  color: var(--muted);
+}
+
 .app-settings-toggle {
   width: 100%;
 }

@@ -58,6 +58,18 @@ type Tab = 'browser' | 'bookmarks' | 'contacts' | 'chat' | 'video' | 'assistant'
 
 type ContactDisplay = { id: string; name: string; peerKey: string; proof: string }
 type AppIdentityResult = { username: string; device: string; displayName: string }
+type PendingOp =
+  | { kind: 'bookmark'; payload: { url: string; title: string; created_at_ms: number } }
+  | {
+      kind: 'contact'
+      payload: {
+        display_name: string
+        peer_agent_pubkey_b64: string
+        invite_proof_b64: string
+        created_at_ms: number
+      }
+    }
+  | { kind: 'chat'; payload: { thread_id: string; body: string; sent_at_ms: number } }
 
 const LS_BOOKMARKS = 'holobro-demo-bookmarks'
 const LS_BOOKMARKS_LEGACY = 'hab-demo-bookmarks'
@@ -69,6 +81,7 @@ const LS_STARTUP_GREETING = 'holobro-startup-greeting'
 const LS_COOKIE_JAR = 'holobro-cookie-jar-count'
 const LS_WANDERER_ENABLED = 'holobro-wanderer-enabled'
 const LS_WANDERER_SOUND_PACK = 'holobro-wanderer-sound-pack'
+const LS_PENDING_OPS = 'holobro-pending-ops'
 
 function loadJson<T>(key: string, fallback: T): T {
   try {
@@ -150,10 +163,16 @@ function playTranceBed() {
 }
 
 function AppShell() {
+  const hasHoloConfig = Boolean(
+    (import.meta.env.VITE_HC_APP_WS as string | undefined)?.trim()
+    && (import.meta.env.VITE_HC_APP_TOKEN as string | undefined)?.trim(),
+  )
+  const holoWsTarget = ((import.meta.env.VITE_HC_APP_WS as string | undefined)?.trim() || 'not set')
+  const holoRoleName = (import.meta.env.VITE_HC_ROLE_NAME as string | undefined)?.trim() || 'anon_browser'
+
   const [tab, setTab] = useState<Tab>('browser')
   const [hc, setHc] = useState<AppWebsocket | null>(null)
   const [hcStatus, setHcStatus] = useState<string>('Disconnected (demo storage)')
-  const [hcAttempted, setHcAttempted] = useState(false)
   const [url, setUrl] = useState('https://example.com')
   const [browserSettings, setBrowserSettings] = useState<BrowserSettings>(() =>
     loadBrowserSettings(),
@@ -183,6 +202,8 @@ function AppShell() {
   const remoteVid = useRef<HTMLVideoElement>(null)
   const pcRef = useRef<RTCPeerConnection | null>(null)
   const hcConnectingRef = useRef(false)
+  const lastConnectTryRef = useRef(0)
+  const replayInFlightRef = useRef(false)
   const [videoPeerB64, setVideoPeerB64] = useState('')
   const [videoLog, setVideoLog] = useState<string[]>([])
   const [appSettingsOpen, setAppSettingsOpen] = useState(false)
@@ -203,11 +224,17 @@ function AppShell() {
     const n = Number(raw ?? '0')
     return Number.isFinite(n) && n > 0 ? Math.min(999, Math.floor(n)) : 0
   })
+  const [pendingOps, setPendingOps] = useState<PendingOp[]>(() =>
+    loadJson<PendingOp[]>(LS_PENDING_OPS, []),
+  )
 
   const connectHolo = useCallback(async () => {
-    if (hc || hcConnectingRef.current || hcAttempted) return
+    if (hc || hcConnectingRef.current) return
+    const now = Date.now()
+    if (now - lastConnectTryRef.current < 2500) return
+    lastConnectTryRef.current = now
     hcConnectingRef.current = true
-    setHcAttempted(true)
+    setHcStatus((s) => (s.startsWith('Connected') ? s : 'Connecting to Holochain…'))
     const r = await tryConnectHolo()
     if (r.ok) {
       setHc(r.client)
@@ -226,10 +253,14 @@ function AppShell() {
         setHcStatus((s) => `${s} — zome read failed (see console).`)
       }
     } else {
-      setHcStatus(`Demo mode: ${r.reason}`)
+      setHcStatus(
+        hasHoloConfig
+          ? `Demo fallback (retrying): ${r.reason}`
+          : `Demo mode: ${r.reason}`,
+      )
     }
     hcConnectingRef.current = false
-  }, [hc, hcAttempted])
+  }, [hc, hasHoloConfig])
 
   useEffect(() => {
     const needsHolo = tab === 'bookmarks' || tab === 'contacts' || tab === 'chat' || tab === 'video'
@@ -240,6 +271,54 @@ function AppShell() {
     const t = window.setTimeout(() => void connectHolo(), 2500)
     return () => window.clearTimeout(t)
   }, [connectHolo])
+
+  useEffect(() => {
+    if (!hasHoloConfig || hc) return
+    const t = window.setInterval(() => {
+      void connectHolo()
+    }, 15000)
+    return () => window.clearInterval(t)
+  }, [hasHoloConfig, hc, connectHolo])
+
+  useEffect(() => {
+    if (!hc || pendingOps.length === 0 || replayInFlightRef.current) return
+    replayInFlightRef.current = true
+    void (async () => {
+      let remaining = [...pendingOps]
+      let applied = 0
+      for (let i = 0; i < remaining.length; i += 1) {
+        const op = remaining[i]
+        try {
+          if (op.kind === 'bookmark') {
+            await hcCreateBookmark(hc, op.payload)
+          } else if (op.kind === 'contact') {
+            await hcCreateContact(hc, op.payload)
+          } else if (op.kind === 'chat') {
+            await hcSendChat(hc, op.payload)
+          }
+          applied += 1
+        } catch {
+          remaining = remaining.slice(i)
+          setPendingOps(remaining)
+          setHcStatus(`Connected (sync paused: ${remaining.length} queued op${remaining.length === 1 ? '' : 's'})`)
+          replayInFlightRef.current = false
+          return
+        }
+      }
+      if (applied > 0) {
+        setPendingOps([])
+        try {
+          setBookmarks(await hcListBookmarks(hc))
+          setContacts(await hcListContacts(hc))
+          setChatMessages(await hcListThread(hc, threadId))
+        } catch {
+          // Best-effort refresh after replay.
+        }
+        setHcStatus(`Connected to Holochain (synced ${applied} queued op${applied === 1 ? '' : 's'})`)
+      }
+      replayInFlightRef.current = false
+    })()
+  }, [hc, pendingOps, threadId])
 
   useEffect(() => {
     saveJson(LS_BOOKMARKS, demoBookmarks)
@@ -279,6 +358,9 @@ function AppShell() {
   useEffect(() => {
     localStorage.setItem(LS_COOKIE_JAR, String(cookieJarCount))
   }, [cookieJarCount])
+  useEffect(() => {
+    saveJson(LS_PENDING_OPS, pendingOps)
+  }, [pendingOps])
 
   useEffect(() => {
     if (!startupGreetingEnabled) return
@@ -346,12 +428,19 @@ function AppShell() {
     const u = normalizeUrl(url)
     const title = new URL(u).hostname
     const now = Date.now()
+    const payload = { url: u, title, created_at_ms: now }
     setCookieJarCount((c) => Math.min(999, c + 1))
     if (hc) {
-      await hcCreateBookmark(hc, { url: u, title, created_at_ms: now })
-      setBookmarks(await hcListBookmarks(hc))
+      try {
+        await hcCreateBookmark(hc, payload)
+        setBookmarks(await hcListBookmarks(hc))
+      } catch {
+        setPendingOps((prev) => [...prev, { kind: 'bookmark', payload }])
+        setHcStatus('Connected (bookmark queued for sync)')
+      }
     } else {
       setDemoBookmarks((prev) => [...prev, { url: u, title }])
+      setPendingOps((prev) => [...prev, { kind: 'bookmark', payload }])
     }
   }
 
@@ -366,16 +455,23 @@ function AppShell() {
 
   const addContact = async (name: string, peerKey: string, proof: string) => {
     const now = Date.now()
+    const payload = {
+      display_name: name,
+      peer_agent_pubkey_b64: peerKey.trim(),
+      invite_proof_b64: proof || '',
+      created_at_ms: now,
+    }
     if (hc) {
-      await hcCreateContact(hc, {
-        display_name: name,
-        peer_agent_pubkey_b64: peerKey.trim(),
-        invite_proof_b64: proof || '',
-        created_at_ms: now,
-      })
-      setContacts(await hcListContacts(hc))
+      try {
+        await hcCreateContact(hc, payload)
+        setContacts(await hcListContacts(hc))
+      } catch {
+        setPendingOps((prev) => [...prev, { kind: 'contact', payload }])
+        setHcStatus('Connected (contact queued for sync)')
+      }
     } else {
       setDemoContacts((prev) => [...prev, { name, peerKey, proof }])
+      setPendingOps((prev) => [...prev, { kind: 'contact', payload }])
     }
   }
 
@@ -383,12 +479,20 @@ function AppShell() {
     const body = chatInput.trim()
     if (!body) return
     const now = Date.now()
+    const payload = { thread_id: threadId, body, sent_at_ms: now }
     if (hc) {
-      await hcSendChat(hc, { thread_id: threadId, body, sent_at_ms: now })
-      setChatInput('')
-      await refreshThread()
+      try {
+        await hcSendChat(hc, payload)
+        setChatInput('')
+        await refreshThread()
+      } catch {
+        setPendingOps((prev) => [...prev, { kind: 'chat', payload }])
+        setChatInput('')
+        setHcStatus('Connected (chat queued for sync)')
+      }
     } else {
       setDemoChat((prev) => [...prev, { thread: threadId, body, at: now }])
+      setPendingOps((prev) => [...prev, { kind: 'chat', payload }])
       setChatInput('')
     }
   }
@@ -571,6 +675,48 @@ function AppShell() {
                   <option value="chaos">Chaos</option>
                 </select>
               </label>
+            </section>
+            <section className="p2p-nav-card" aria-label="P2P health">
+              <div className="p2p-nav-head">
+                <strong className="deps-title">P2P Status</strong>
+                <span className={hc ? 'network-ok-badge' : 'network-miss-badge'}>
+                  {hc ? 'Live' : 'Demo'}
+                </span>
+              </div>
+              <p className="p2p-nav-line">
+                <span className="deps-label">Conductor</span>
+                <span className="mono">{hasHoloConfig ? 'configured' : 'missing env'}</span>
+              </p>
+              <p className="p2p-nav-line">
+                <span className="deps-label">WS</span>
+                <span className="mono" title={holoWsTarget}>
+                  {holoWsTarget.length > 26 ? `${holoWsTarget.slice(0, 26)}…` : holoWsTarget}
+                </span>
+              </p>
+              <p className="p2p-nav-line">
+                <span className="deps-label">Role</span>
+                <span className="mono">{holoRoleName}</span>
+              </p>
+              <p className="p2p-nav-line">
+                <span className="deps-label">Queue</span>
+                <span className="mono">{pendingOps.length}</span>
+              </p>
+              <p className="p2p-nav-note">
+                {hc ? 'Bookmarks/Contacts/Chat/Signals are live.' : 'Using local demo cache until conductor connects.'}
+              </p>
+              <button
+                type="button"
+                className="small"
+                onClick={() => {
+                  setHc(null)
+                  setHcStatus('Reconnecting to Holochain…')
+                  void connectHolo()
+                }}
+                disabled={hcConnectingRef.current}
+                title="Try connecting to Holochain now"
+              >
+                Reconnect P2P
+              </button>
             </section>
             <button
               type="button"
